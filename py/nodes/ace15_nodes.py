@@ -2,7 +2,7 @@ import itertools
 
 import torch
 import yaml
-from comfy import model_management, model_patcher, patcher_extension
+from comfy import model_management, model_patcher, patcher_extension, samplers
 
 from ..ace_utils import LATENT_TIME_MULTIPLIER_15
 
