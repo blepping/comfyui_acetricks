@@ -14,7 +14,7 @@ class Ace15LLMInferenceNode:
 
     _DEFAULT_YAML = """
 # Does logit sampling/manipulation in float64. Not much of a performance cost generally.
-use_float64: true
+sampling_dtype: float64
 # null - no constraint, true - only audio codes tokens, false - only non-audio codes tokens
 ace15_audio_only: null
 
@@ -43,9 +43,10 @@ sampling_parameters:
     cfg_variance_rescaling_strength: 0.0
     # When non-zero will rescale the CFG result mean to match cond by default.
     cfg_mean_rescaling_strength: 0.0
-    # When these are false, will rescale to match uncond instead. Which is probably not good.
-    cfg_variance_rescaling_use_cond: true
-    cfg_mean_rescaling_use_cond: true
+    # Rescaling to cond is the safe option. Other options:
+    #   uncond, diff, neg_diff, min, max
+    cfg_variance_rescaling_target: cond
+    cfg_mean_rescaling_target: cond
     # Only applies when using plausibility masking. When set, will reapply the mask
     # again at the very end, causing stuff like variance rescaling to only apply
     # to the masked items.
@@ -54,9 +55,16 @@ sampling_parameters:
     top_k: 0
     top_p: 0.0
     min_p: 0.075
+    # 0 is disabled. Values above 1.0 penality, non-zero values below it
+    # encourage repetition which is probably not what you want.
     repetition_penalty: 0.0
+    # Windows count from the beginning if positive, or the end if negative.
+    # I.E. -128 means consider at most the last 128 tokens.
+    repetetion_penalty_window: null
+    # N-grams - sequences of however many tokens.
     no_repeat_ngram_size: 0
     no_repeat_ngram_penalty: -.inf
+    no_repeat_ngram_window: null
     # Starts penalizing when 85% of max tokens is reached
     # not counting the prompt.
     max_tokens_expdecay_factor: 0.85
@@ -199,14 +207,25 @@ sampling_parameters:
         csm.reset_clip_options()
         clip.load_model(clip_metadata)
         csm.set_clip_options({"execution_device": clip.patcher.load_device})
-        model_key = getattr(
-            clip.cond_stage_model,
-            "lm_model",
-            getattr(clip.cond_stage_model, "qwen3_06b", None),
-        )
+        model_key = params.pop("model_key", None)
+        if model_key is None:
+            model_key = getattr(
+                clip.cond_stage_model,
+                "lm_model",
+                getattr(clip.cond_stage_model, "qwen3_06b", None),
+            )
         if model_key is None:
             raise ValueError("Missing model key")
         model = getattr(clip.cond_stage_model, model_key)
+        eos_token_id = params.pop("eos_token_id", None)
+        if not isinstance(eos_token_id, int):
+            eos_token_id = getattr(model, "special_tokens", {}).get("eos")
+        if not isinstance(eos_token_id, int):
+            eos_token_id = getattr(tokenizer, "eos_token_id", None)
+        if eos_token_id is None:
+            raise ValueError(
+                "Couldn't determine EOS token id. You may be using an unsupported model.",
+            )
         llm_sampler = Ace15LLMSampling(
             verbose_interval=verbose_interval,
             tokenizer=tokenizer,
@@ -214,7 +233,7 @@ sampling_parameters:
             state_class=partial(
                 ACE15LLMSamplingState,
                 ace15_audio_only=params.get("ace15_audio_only"),
-                eos_token_id=151645,
+                eos_token_id=eos_token_id,
                 custom_noise=custom_noise.clone() if custom_noise is not None else None,
                 **sampling_params,
             ),

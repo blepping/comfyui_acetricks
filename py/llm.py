@@ -2,6 +2,7 @@ import contextlib
 import math
 from collections.abc import Sequence
 from functools import lru_cache
+from typing import Any
 
 import torch
 import transformers
@@ -11,6 +12,31 @@ from tqdm import tqdm
 
 from . import external
 from .utils import TieredBlendWrapper, nanstd
+
+
+class WindowedLogitsProcessor(transformers.LogitsProcessor):
+    def __init__(
+        self,
+        *args: Any,
+        # None - no window. positive value - from start of IDs. negative - from end.
+        window: int | None = None,
+        **kwargs: Any,
+    ):
+        super().__init__(*args, **kwargs)
+        self.window = window
+
+    # Returns the original or a view.
+    def _get_windowed_ids(self, input_ids: torch.LongTensor) -> torch.LongTensor:
+        n_ids = input_ids.shape[-1]
+        if not n_ids or self.window is None:
+            return input_ids
+        wneg = self.window < 0
+        window = n_ids + self.window if wneg else self.window
+        window = max(0, min(window, n_ids - 1))
+        if window < 1:
+            return input_ids
+        ids_slice = slice(None, window + 1) if not wneg else slice(window, None)
+        return input_ids[..., ids_slice]
 
 
 class BiasTokenIdsLogitsProcessor(transformers.LogitsProcessor):
@@ -68,10 +94,16 @@ class BiasTokenIdsLogitsProcessor(transformers.LogitsProcessor):
         return torch.where(mask, adjusted_scores, scores)
 
 
-class NoRepeatNGramExtLogitsProcessor(transformers.LogitsProcessor):
+class NoRepeatNGramExtLogitsProcessor(WindowedLogitsProcessor):
     def __init__(
-        self, ngram_size: int, *, penalty: float = -math.inf, add_penalty: bool = True
+        self,
+        ngram_size: int,
+        *args: Any,
+        penalty: float = -math.inf,
+        add_penalty: bool = True,
+        **kwargs: Any,
     ):
+        super().__init__(*args, **kwargs)
         self.processor = transformers.NoRepeatNGramLogitsProcessor(ngram_size)
         self.penalty = penalty
         self.add_penalty = add_penalty
@@ -81,6 +113,8 @@ class NoRepeatNGramExtLogitsProcessor(transformers.LogitsProcessor):
         input_ids: torch.LongTensor,
         scores: torch.FloatTensor,
     ) -> torch.FloatTensor:
+        input_ids = self._get_windowed_ids(input_ids)
+
         # Transformers logits processors don't do in-place operations, so this is safe.
         processed_scores = self.processor(input_ids, scores)
         # The Transformers logits processor either penalizes by -inf or does nothing.
@@ -89,6 +123,21 @@ class NoRepeatNGramExtLogitsProcessor(transformers.LogitsProcessor):
             scores + self.penalty if self.add_penalty else scores * self.penalty
         )
         return torch.where(mask, processed_scores, scores)
+
+
+class RepetitionPenaltyExtLogitsProcessor(WindowedLogitsProcessor):
+    def __init__(self, *args: Any, **kwargs: Any):
+        window = kwargs.pop("window", None)
+        super().__init__(window=window)
+        self.processor = transformers.RepetitionPenaltyLogitsProcessor(*args, **kwargs)
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        input_ids = self._get_windowed_ids(input_ids)
+        return self.processor(input_ids, scores)
 
 
 class CFGExtLogitsProcessor(transformers.LogitsProcessor):
@@ -335,7 +384,7 @@ class LLMSamplingState:
         min_tokens: int,
         max_tokens: int,
         sampling_dtype: str | None = None,
-        **kwargs,
+        **kwargs: Any,
     ):
         self.device = device
         self.min_tokens = min_tokens
@@ -388,11 +437,13 @@ class LLMSamplingState:
         self.top_k = kwargs.pop("top_k", 0)
         self.min_p = kwargs.pop("min_p", -1.0)
         self.repetition_penalty = kwargs.pop("repetition_penalty", 0.0)
+        self.repetition_penalty_window = kwargs.pop("repetition_penalty_window", None)
         self.no_repeat_ngram_penalty = kwargs.pop("no_repeat_ngram_penalty", -math.inf)
         self.no_repeat_ngram_size = kwargs.pop("no_repeat_ngram_size", 0)
         self.no_repeat_ngram_add_penalty_mode = bool(
             kwargs.pop("no_repeat_ngram_add_penalty_mode", True),
         )
+        self.no_repeat_ngram_window = kwargs.pop("no_repeat_ngram_window", None)
         self.logits_processors = self.get_logits_processors()
 
     def get_logits_processors(self) -> transformers.LogitsProcessorList:
@@ -402,8 +453,9 @@ class LLMSamplingState:
             lp_list.append(CFGExtLogitsProcessor(**self.cfg_kwargs))
         if self.repetition_penalty > 0.0:
             lp_list.append(
-                transformers.RepetitionPenaltyLogitsProcessor(
-                    penalty=self.repetition_penalty
+                RepetitionPenaltyExtLogitsProcessor(
+                    penalty=self.repetition_penalty,
+                    window=self.repetition_penalty_window,
                 ),
             )
         if self.no_repeat_ngram_size > 0 and self.no_repeat_ngram_penalty != 0.0:
@@ -412,6 +464,7 @@ class LLMSamplingState:
                     ngram_size=self.no_repeat_ngram_size,
                     penalty=self.no_repeat_ngram_penalty,
                     add_penalty=bool(self.no_repeat_ngram_add_penalty_mode),
+                    window=self.no_repeat_ngram_window,
                 ),
             )
         if self.eos_token_id is not None and self.min_tokens > 0:
@@ -646,11 +699,12 @@ class ModelLLM:
         device: torch.device | str | None = None,
     ):
         self.model = model
+        special_tokens = getattr(model, "special_tokens", {})
         self.pad_token = (
-            pad_token if pad_token is not None else model.special_tokens.get("pad")
+            pad_token if pad_token is not None else special_tokens.get("pad")
         )
         self.eos_token = (
-            eos_token if eos_token is not None else model.special_tokens.get("eos")
+            eos_token if eos_token is not None else special_tokens.get("eos")
         )
         self.device = (
             torch.device(device) if device is not None else model.execution_device
@@ -717,7 +771,7 @@ class ModelLLM:
             padded_ids,
             self.device,
         )
-        embeds, attention_mask, num_tokens, embeds_info = self.model_state
+        embeds, attention_mask, _num_tokens, _embeds_info = self.model_state
         for i, pt in enumerate(pad_tokens):
             pad_len = len(pt)
             attention_mask[i, :pad_len] = 0
@@ -782,9 +836,9 @@ class LLMSampling:
     def token_output(
         self,
         *,
-        step: int,
+        step: int,  # noqa: ARG002
         tokens: list[int],
-        current_tokens: list[list[int]] | None = None,
+        current_tokens: list[list[int]] | None = None,  # noqa: ARG002
     ) -> list[int]:
         return tokens
 
