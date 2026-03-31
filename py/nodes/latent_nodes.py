@@ -166,7 +166,7 @@ class VisualizeLatentNode:
             else tuple(int(dim) for dim in normalize_dims.split(","))
         )
         samples = latent["samples"].to(dtype=torch.float32, device="cpu")
-        if samples.ndim == 3 and samples.shape[1] == 64:
+        if samples.ndim == 3 and samples.shape[1] in {6, 64, 2048}:
             samples = samples.unsqueeze(-2)
             temporal_scale_factor = LATENT_TIME_MULTIPLIER_15
         elif samples.ndim == 4:

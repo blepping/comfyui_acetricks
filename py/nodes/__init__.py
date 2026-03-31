@@ -1,4 +1,5 @@
 from .ace15_nodes import (
+    Ace15AudioCodesToLatentNode,
     Ace15CompressDuplicateAudioCodesNode,
     Ace15LatentToAudioCodesNode,
     EmptyAce15LatentFromConditioningNode,
@@ -52,6 +53,7 @@ NODE_CLASS_MAPPINGS = {
     "ACETricks TextEncodeAce15": TextEncodeAce15Node,
     "ACETricks RawTextEncodeAce15": RawTextEncodeAce15Node,
     "ACETricks Ace15LatentToAudioCodes": Ace15LatentToAudioCodesNode,
+    "ACETricks Ace15AudioCodesToLatent": Ace15AudioCodesToLatentNode,
     "ACETricks Ace15LLMInference": Ace15LLMInferenceNode,
 }
 

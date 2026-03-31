@@ -140,6 +140,32 @@ class RepetitionPenaltyExtLogitsProcessor(WindowedLogitsProcessor):
         return self.processor(input_ids, scores)
 
 
+class ForbidPrefixLogitsProcessor(transformers.LogitsProcessor):
+    def __init__(self, prefix: list[int] | tuple[int, ...]):
+        super().__init__()
+        self.forbidden_prefix = tuple(prefix)
+
+    def __call__(
+        self,
+        input_ids: torch.LongTensor,
+        scores: torch.FloatTensor,
+    ) -> torch.FloatTensor:
+        pfx = self.forbidden_prefix
+        pfx_len = len(pfx)
+        n_ids = input_ids.shape[-1]
+        token_id = pfx[n_ids - 1] if n_ids < pfx_len else -1
+        scores = scores.clone()
+        if (
+            n_ids == 0
+            or n_ids > pfx_len
+            or token_id < 0
+            or token_id >= scores.shape[-1]
+        ):
+            return scores
+        scores[..., token_id] = -math.inf
+        return scores
+
+
 class CFGExtLogitsProcessor(transformers.LogitsProcessor):
     @staticmethod
     def simple_cfg(
@@ -532,8 +558,9 @@ class LLMSamplingState:
 
 
 class ACE15LLMSamplingState(LLMSamplingState):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args: Any, **kwargs: Any):
         ace15_audio_only = kwargs.pop("ace15_audio_only", None)
+        forbid_prefix = kwargs.pop("tokens_forbid_prefix", None)
         custom_noise = kwargs.pop("custom_noise", None)
         custom_noise_topk = kwargs.pop("custom_noise_topk", 250)
         custom_noise_topk_temperature_rescaling = kwargs.pop(
@@ -560,6 +587,9 @@ class ACE15LLMSamplingState(LLMSamplingState):
                     ),
                 ),
             )
+        if forbid_prefix:
+            # Shouldn't matter if this is before or after token biasing.
+            self.logits_processors.insert(1, ForbidPrefixLogitsProcessor(forbid_prefix))
         self.custom_noise = custom_noise
         if custom_noise is None:
             return
@@ -595,13 +625,13 @@ class ACE15LLMSamplingState(LLMSamplingState):
         if self.custom_noise_topk < 1:
             return None
         k = min(self.custom_noise_topk, logits.shape[-1])
-        tk_vals = torch.topk(
+        tk_vals, _tk_idxs = torch.topk(
             logits * self.temperature
             if self.custom_noise_topk_temperature_rescaling
             and self.temperature not in {0.0, 1.0}
             else logits,
             k=k,
-        )[0]
+        )
 
         # Best scores (per batch)
         best_scores = tk_vals[:, :1]
@@ -625,7 +655,7 @@ class ACE15LLMSamplingState(LLMSamplingState):
         logits: torch.Tensor,
         noise: torch.Tensor,
         noise_shape: torch.Size | tuple[int, ...],
-        topk_std: torch.Tensor | None,
+        topk_std: torch.Tensor | None,  # noqa: ARG002
         # Proxy values for -inf and +inf, this percentage of the dtype min/max values.
         ninf_proxy_multiplier: float = 0.85,
         pinf_proxy_multiplier: float = 0.85,

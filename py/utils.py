@@ -153,7 +153,7 @@ class TieredBlendWrapper:
         if t_is_tensor:
             t_vals = torch.gather(t_flat, dim=-1, index=indices)
 
-        # PAD (If length is not divisible by tiers)
+        # Pad if length not divisible by tiers.
         pad_len = (self.tiers - (length % self.tiers)) % self.tiers
         if pad_len > 0:
             a_vals = F.pad(a_vals, (0, pad_len), value=self.pad_value)

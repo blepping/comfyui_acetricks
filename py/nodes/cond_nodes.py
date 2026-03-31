@@ -1,3 +1,5 @@
+import torch
+
 SPLIT_KEYS = ("conditioning_lyrics", "lyrics_strength", "audio_codes")
 
 
@@ -66,9 +68,10 @@ class JoinLyricsNode:
                 conditioning_lyrics + [conditioning_lyrics[-1]] * (ct_len - cl_len)
             )[:ct_len]
         elif ct_len != cl_len:
-            raise ValueError(
+            errstr = (
                 f"Different lengths for tags {ct_len} vs conditioning lyrics {cl_len}"
             )
+            raise ValueError(errstr)
         result = [
             [
                 cond_t.clone(),
@@ -84,7 +87,11 @@ class JoinLyricsNode:
                 and cond_d.get("end_percent", 1.0) <= end_time
                 else cond_d.copy(),
             ]
-            for (cond_t, cond_d), cond_l in zip(conditioning_tags, conditioning_lyrics)
+            for (cond_t, cond_d), cond_l in zip(
+                conditioning_tags,
+                conditioning_lyrics,
+                strict=False,
+            )
         ]
         return (result,)
 

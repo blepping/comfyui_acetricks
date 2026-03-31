@@ -1,10 +1,14 @@
+from collections.abc import Sequence
+from typing import NamedTuple
+
 import torch
+from comfy import model_management
 
 try:
     from comfy.ldm.ace.ace_step15 import get_silence_latent as get_ace15_silence_latent
 
     HAVE_ACE15_SILENCE = True
-except Exception:
+except Exception:  # noqa: BLE001
     HAVE_ACE15_SILENCE = False
 
 
@@ -161,6 +165,104 @@ ACE10_SILENCE = torch.tensor(
     dtype=torch.float32,
     device="cpu",
 )[None, ..., None]
+
+
+def parse_audio_codes(audio_codes: str | Sequence[int] | None) -> tuple[int, ...]:
+    if audio_codes is None:
+        return ()
+    if isinstance(audio_codes, str):
+        audio_codes = audio_codes.strip()
+        if audio_codes.startswith("<|audio_code_"):
+            cs = tuple(
+                ac.rsplit("_", 1)[-1].strip()
+                for ac in audio_codes.split("|")
+                if ac.startswith("audio_code_")
+            )
+        else:
+            cs = tuple(ac.strip() for ac in audio_codes.split(","))
+        if not all(ac.isdigit() for ac in cs if ac):
+            raise ValueError(
+                "When specified as a string, codes must be comma separated integer values or a sequence of <|audio_code_123|> tokens",
+            )
+        audio_codes = tuple(int(ac) for ac in cs if ac)
+    else:
+        audio_codes = tuple(audio_codes)
+    if not all(isinstance(ac, int) and (0 <= ac < 64000) for ac in audio_codes):
+        raise TypeError("Audio codes must parse to integer values >= 0 and < 64000.")
+    return audio_codes
+
+
+class DeconstructedHints(NamedTuple):
+    indices: torch.Tensor
+    hints_2048d: torch.Tensor
+    hints_6d: torch.Tensor
+
+    @classmethod
+    def deconstruct(
+        cls,
+        model: object,
+        hints_5hz: torch.Tensor,
+        *,
+        dtype: torch.dtype | None = torch.float32,
+        chunk_size: int = 512,
+    ) -> "DeconstructedHints":
+        quantizer: torch.nn.Module = model.tokenizer.quantizer
+        device = hints_5hz.device
+        orig_dtype = hints_5hz.dtype
+
+        if dtype is not None and dtype != orig_dtype:
+            hints_5hz = hints_5hz.to(dtype=dtype)
+
+        fsq_layer = quantizer.layers[0]
+        scale = quantizer.scales[0].to(dtype=dtype, device=device)
+
+        # 1. Grab the pure [-1, 1] continuous coordinates for all 64,000 possible codes
+        implicit_cb = model_management.cast_to(
+            fsq_layer.implicit_codebook,
+            device=device,
+            dtype=dtype,
+        )
+
+        # 2. Project all 64,000 codes into the 2048D semantic space
+        valid_6d = implicit_cb * scale
+        valid_2048d = quantizer.project_out(valid_6d)  # Shape: [64000, 2048]
+
+        batch, sequence, dims = hints_5hz.shape
+        hints_flat = hints_5hz.reshape(batch * sequence, dims)
+
+        new_indices_flat = torch.empty(
+            batch * sequence,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        # 3. Find the closest valid codebook item for every frame
+        # We process in chunks to prevent VRAM spikes (512 * 64k is tiny)
+        for i in range(0, batch * sequence, chunk_size):
+            chunk = hints_flat[i : i + chunk_size]
+
+            # Compute L2 distance between our hints and the 64k valid 2048D vectors
+            dists = torch.cdist(chunk, valid_2048d)  # Shape: [chunk_size, 64000]
+
+            # Because our codes are exactly indexed 0-63999, the argmin gives us the integer code.
+            new_indices_flat[i : i + chunk_size] = torch.argmin(dists, dim=-1).to(
+                torch.int32,
+            )
+
+        new_indices = new_indices_flat.view(batch, sequence)
+
+        # 4. Extract the snapped 6D continuous vectors
+        quantized_6d = torch.nn.functional.embedding(new_indices, implicit_cb)
+        quantized_6d *= scale
+
+        # 5. Project back to 2048D
+        new_hints_5hz = quantizer.project_out(quantized_6d)
+
+        new_hints_5hz, quantized_6d = (
+            t.to(dtype=orig_dtype) for t in (new_hints_5hz, quantized_6d)
+        )
+        return cls(new_indices, new_hints_5hz, quantized_6d)
+
 
 __all__ = (
     "ACE10_SILENCE",

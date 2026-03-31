@@ -1,10 +1,11 @@
 import itertools
+from typing import Any, NamedTuple
 
 import torch
 import yaml
 from comfy import model_management, model_patcher, patcher_extension, samplers
 
-from ..ace_utils import LATENT_TIME_MULTIPLIER_15
+from ..ace_utils import LATENT_TIME_MULTIPLIER_15, DeconstructedHints, parse_audio_codes
 
 
 class ModelPatchAce15Use4dLatentNode:
@@ -666,7 +667,7 @@ audio_codes: null
         )
         if not all(isinstance(p, str) for p in (dit_prompt, lyrics_prompt)):
             raise ValueError(
-                "At the least, dit_prompt and lyrics_prompt keys must be specified and be type string."
+                "At the least, dit_prompt and lyrics_prompt keys must be specified and be type string.",
             )
         audio_codes = (
             audio_codes
@@ -678,7 +679,7 @@ audio_codes: null
         if isinstance(audio_codes, (tuple, list)):
             if not all(isinstance(ac, int) for ac in audio_codes):
                 raise TypeError(
-                    "When present, audio codes must be a list of integer values."
+                    "When present, audio codes must be a list of integer values.",
                 )
         elif isinstance(audio_codes, str):
             if audio_codes.startswith("<|audio_code_"):
@@ -730,7 +731,7 @@ audio_codes: null
         encode_input["lm_metadata"] = lm_metadata
         if verbose:
             print(
-                f"\n*** ACETricks RawTextEncodeAce15 debug:\n* PROMPTS: {dict(prompts)}\n* ENCODE INPUT: {encode_input}\n* AUDIO_CODES: {audio_codes}\n"
+                f"\n*** ACETricks RawTextEncodeAce15 debug:\n* PROMPTS: {dict(prompts)}\n* ENCODE INPUT: {encode_input}\n* AUDIO_CODES: {audio_codes}\n",
             )
         conditioning = clip.encode_from_tokens_scheduled(encode_input)
         if audio_codes is not None:
@@ -740,24 +741,24 @@ audio_codes: null
 
 
 class Ace15LatentToAudioCodesNode:
-    DESCRIPTION = "Extracts audio codes from an ACE-Steps 1.5 latent. This is probably not working correctly at the moment since the extracted codes don't work very well for sampling."
+    DESCRIPTION = "Extracts audio codes from an ACE-Steps 1.5 latent or ACE15_LM_HINTS input (just pass it as a latent). This is probably not working correctly at the moment since the extracted codes don't work very well for sampling."
     FUNCTION = "go"
     CATEGORY = "audio/acetricks"
-    RETURN_TYPES = ("CONDITIONING_ACE_LYRICS", "LATENT", "STRING")
+    RETURN_TYPES = ("CONDITIONING_ACE_LYRICS", "LATENT", "STRING", "ACE15_LM_HINTS")
 
     @classmethod
     def INPUT_TYPES(cls) -> dict:
         return {
             "required": {
                 "model": ("MODEL",),
-                "latent": ("LATENT",),
+                "latent": ("LATENT,ACE15_LM_HINTS",),
             },
             "optional": {
                 "include_upsampled_codes": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "There isn't anything that can use this yet.",
+                        "tooltip": "When disabled, the latent output will just be an empty latent.",
                     },
                 ),
             },
@@ -770,22 +771,34 @@ class Ace15LatentToAudioCodesNode:
         latent: torch.Tensor,
         *,
         upsample_codes: bool,
-    ) -> tuple[list[int], torch.Tensor | None]:
-        audio_codes, indices = model.tokenizer.tokenize(latent.mT)
-        print(f"\nGot: {audio_codes.shape}, {indices.shape}")
-        # mask = (indices > 0) & (indices < 64000)
+    ) -> tuple[list[int], torch.Tensor, torch.Tensor | None]:
+        if latent.shape[1] == 2048:
+            dr = DeconstructedHints.deconstruct(model, latent.mT, dtype=torch.float32)
+            indices, lm_hints_5hz = dr.indices, dr.hints_2048d
+            lm_hints_5hz = lm_hints_5hz.to(dtype=latent.dtype)
+        elif latent.shape[1] == 6:
+            # TODO: Nuke this?
+            latent = latent.mT.clamp(-1, 1)
+            indices = model.tokenizer.quantizer.layers[0].codes_to_indices(latent)
+            lm_hints_5hz = model.tokenizer.quantizer.project_out(latent)
+        else:
+            lm_hints_5hz, indices = model.tokenizer.tokenize(latent.mT)
         mask = (indices < 64000) & (indices >= 0)
         indices = indices[mask].reshape(latent.shape[0], -1).detach().cpu().tolist()
         if upsample_codes:
-            raw_upsampled_codes = model.detokenizer(audio_codes)
-            print(f"\nUpsampled: {raw_upsampled_codes.shape}")
+            raw_upsampled_codes = model.detokenizer(lm_hints_5hz)
             upsampled_codes = raw_upsampled_codes.mT.detach().float().cpu()
         else:
             upsampled_codes = None
-        # print(
-        #     f"\nGOT:\nCODES={audio_codes}\nUPSAMPLED:{upsampled_codes}\nINDICES: {indices}"
-        # )
-        return indices, upsampled_codes
+        lm_hints_5hz = (
+            lm_hints_5hz.detach()
+            .mT.contiguous()
+            .to(
+                dtype=torch.float32,
+                device=model_management.intermediate_device(),
+            )
+        )
+        return indices, lm_hints_5hz, upsampled_codes
 
     @classmethod
     def go(
@@ -794,20 +807,22 @@ class Ace15LatentToAudioCodesNode:
         model: object,
         latent: dict,
         include_upsampled_codes: bool = False,
-    ) -> tuple[list[dict], dict]:
+    ) -> tuple[list[dict], dict[str, Any], str, dict[str, Any]]:
         samples = latent["samples"]
+        if samples.shape[0] != 1:
+            raise ValueError("This node can't current handle batches")
         if samples.ndim == 4 and samples.shape[-2] == 1:
             samples = samples.squeeze(-2)
-        if samples.ndim != 3 or samples.shape[1] != 64:
+        if samples.ndim != 3 or samples.shape[1] not in {64, 2048}:
             raise ValueError(
-                "Incorrect latent format, doesn't appear to be an ACE-Steps 1.5 latent."
+                "Incorrect latent format, doesn't appear to be a valid ACE-Steps 1.5 latent or ACE15_LM_HINTS.",
             )
         model_management.load_model_gpu(model)
         mmodel = model.model
         device = mmodel.device
         dtype = mmodel.get_dtype()
         samples = samples.to(device=device, dtype=dtype)
-        ac, uac = cls.get_audio_codes(
+        ac, hints, uac = cls.get_audio_codes(
             mmodel.diffusion_model,
             samples,
             upsample_codes=include_upsampled_codes,
@@ -824,7 +839,86 @@ class Ace15LatentToAudioCodesNode:
                     1,
                     device="cpu",
                     dtype=torch.float32,
-                )
+                ),
             }
-        ac_tokens = "".join(f"<|audio_code_{i}|>" for i in ac)
-        return ([result], latent, ac_tokens)
+        ac_tokens = "".join(f"<|audio_code_{i}|>" for i in ac[0])
+        return (
+            [result],
+            latent,
+            ac_tokens,
+            {"samples": hints, "type": "ace15_lm_hints"},
+        )
+
+
+class Ace15AudioCodesToLatentNode:
+    DESCRIPTION = "Converts audio codes from either a string or CONDITIONING_ACE_LYRICS to the 'upscaled' format (same shape as a latent). Note that if it's something like codes from a LLM then it will be lacking timbre information so you can't actually VAE decode it to audio."
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("LATENT", "ACE15_LM_HINTS")
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "codes_source": (
+                    "STRING,CONDITIONING_ACE_LYRICS",
+                    {
+                        "tooltip": "This can accept either a string or CONDITIONING_ACE_LYRICS as input. For the second option, the first item needs to actually have codes present.",
+                    },
+                ),
+            },
+        }
+
+    @classmethod
+    def go(
+        cls,
+        *,
+        model: object,
+        codes_source: str | list,
+    ) -> tuple[dict, dict]:
+        if (
+            isinstance(codes_source, (list, tuple))
+            and len(codes_source)
+            and isinstance(codes_source[0], dict)
+            and "audio_codes" in codes_source[0]
+        ):
+            audio_codes = tuple(codes_source[0]["audio_codes"][0])
+        elif isinstance(codes_source, str):
+            audio_codes = parse_audio_codes(codes_source)
+        else:
+            raise ValueError(
+                "Unexpected input for codes_source: Must either CONDITIONING_ACE_LYRICS with audio codes in the first conditioning item or a string in the format '1,2,3,4' or '<|audio_code_1|><|audio_code_2|>' where the codes values are between 0 and 63999  inclusive (whitespace is okay).",
+            )
+        if not audio_codes:
+            raise ValueError("List of audio codes is empty")
+
+        model_management.load_model_gpu(model)
+        mmodel = model.model
+        dmodel = mmodel.diffusion_model
+        if not (
+            hasattr(dmodel, "tokenizer") and hasattr(dmodel.tokenizer, "quantizer")
+        ):
+            raise ValueError(
+                "Can't find tokenizer or quantizer in model. Supplied model input must be ACE-Step 1.5.",
+            )
+        device = mmodel.device
+        codes_tensor = torch.tensor((audio_codes,), dtype=torch.int64, device=device)
+        quantizer = dmodel.tokenizer.quantizer
+        hints_5hz = quantizer.get_output_from_indices(codes_tensor).to(
+            dtype=torch.float32,
+        )
+        hints_5hz = DeconstructedHints.deconstruct(dmodel, hints_5hz).hints_2048d
+        hints_25hz = dmodel.detokenizer(hints_5hz)
+        hints_5hz, hints_25hz = (
+            t.detach()
+            .mT.contiguous()
+            .to(
+                dtype=torch.float32,
+                device=model_management.intermediate_device(),
+            )
+            for t in (hints_5hz, hints_25hz)
+        )
+        result_5hz = {"samples": hints_5hz, "type": "ace15_lm_hints"}
+        result_25hz = {"samples": hints_25hz, "type": "audio"}
+        return (result_25hz, result_5hz)

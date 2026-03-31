@@ -153,6 +153,14 @@ sampling_parameters:
                         "tooltip": "Optional custom noise input for temperature sampling. Can take custom noise inputs from my ComfyUI-Sonar and comfyui_overly_complicated_sampling node packs. Note: You will probably want to use a noise factor around 0.4 to 0.6 and also make sure that the noise is normalized. This will not work well with noise samplers that care about the sigma.",
                     },
                 ),
+                "forbid_prefix": (
+                    "STRING",
+                    {
+                        "dynamicPrompts": False,
+                        "multiline": True,
+                        "tooltip": "Prevents the output from starting with these tokens if connected. For example, if we have tokens 'A B C' here then the model can't generate 'A B C whatever' or 'X B C whatever', however it could generate 'X A B C whatever'. In other words, it bans the token from existing in that slot.",
+                    },
+                ),
             },
         }
 
@@ -169,6 +177,7 @@ sampling_parameters:
         yaml_params: str,
         llm_prompt_negative: str | None = None,
         custom_noise: object | None = None,
+        forbid_prefix: str | None = None,
     ) -> tuple:
         params = yaml.safe_load(yaml_params)
         if not isinstance(params, dict):
@@ -179,7 +188,10 @@ sampling_parameters:
             max(minimum_tokens, maximum_tokens),
         )
         clip = clip.clone()
-        clip_tokenizer = getattr(clip.tokenizer, clip.tokenizer.clip).tokenizer
+        if hasattr(clip.tokenizer, "clip"):
+            clip_tokenizer = getattr(clip.tokenizer, clip.tokenizer.clip).tokenizer
+        else:
+            clip_tokenizer = clip.tokenizer.tokenizer
         tokenizer_path = getattr(clip_tokenizer, "init_kwargs", {}).get("name_or_path")
         if tokenizer_path is None:
             raise ValueError("Missing tokenizer path")
@@ -190,11 +202,14 @@ sampling_parameters:
         if add_ace15_tokens:
             tokenizer.add_tokens([f"<|audio_code_{i}|>" for i in range(64000)])
         tokens = tokenizer.encode(llm_prompt)
+        tokens_forbid_prefix = (
+            None if not forbid_prefix else tokenizer.encode(forbid_prefix)
+        )
         cfg_scale = sampling_params.get("cfg_scale", 1.0)
         if cfg_scale != 1.0:
             if llm_prompt_negative is None:
                 raise ValueError(
-                    "Must provide negative prompt when cfg_scale is not 1.0"
+                    "Must provide negative prompt when cfg_scale is not 1.0",
                 )
             tokens_neg = tokenizer.encode(llm_prompt_negative)
         else:
@@ -235,6 +250,7 @@ sampling_parameters:
                 ace15_audio_only=params.get("ace15_audio_only"),
                 eos_token_id=eos_token_id,
                 custom_noise=custom_noise.clone() if custom_noise is not None else None,
+                tokens_forbid_prefix=tokens_forbid_prefix,
                 **sampling_params,
             ),
         )
