@@ -166,11 +166,16 @@ class VisualizeLatentNode:
             else tuple(int(dim) for dim in normalize_dims.split(","))
         )
         samples = latent["samples"].to(dtype=torch.float32, device="cpu")
-        if samples.ndim == 3 and samples.shape[1] in {6, 64, 2048}:
+        channels = samples.shape[1]
+        if samples.ndim == 4 and samples.chape[2] == 1:
+            samples = samples.squeeze(2)
+        if samples.ndim == 3:
             samples = samples.unsqueeze(-2)
             temporal_scale_factor = LATENT_TIME_MULTIPLIER_15
+            if channels != 64:
+                temporal_scale_factor /= 5
         elif samples.ndim == 4:
-            temporal_scale_factor = LATENT_TIME_MULTIPLIER
+            temporal_scale_factor = LATENT_TIME_MULTIPLIER if channels == 8 else 1.0
         else:
             raise ValueError(
                 "Expected an ACE-Steps 1.0 latent with 4 dimensions or an Ace-Step 1.5 latent with 3 dimensions and 64 channels.",

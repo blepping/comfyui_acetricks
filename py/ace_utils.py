@@ -197,6 +197,37 @@ class DeconstructedHints(NamedTuple):
     hints_2048d: torch.Tensor
     hints_6d: torch.Tensor
 
+    @staticmethod
+    def get_codebook_parts(
+        model: object,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = torch.float32,
+        # Returns projection, implicit codebook, scale
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if not (hasattr(model, "tokenizer") and hasattr(model.tokenizer, "quantizer")):
+            raise ValueError(
+                "Can't find tokenizer or quantizer in model. Supplied model input must be ACE-Step 1.5.",
+            )
+        quantizer: torch.nn.Module = model.tokenizer.quantizer
+
+        if len(quantizer.layers) != 1:
+            raise ValueError("Unexpected number of quantizer layers (>1)")
+        fsq_layer = quantizer.layers[0]
+        scale = quantizer.scales[0].to(dtype=dtype, device=device)
+
+        # 1. Grab the pure [-1, 1] continuous coordinates for all 64,000 possible codes
+        implicit_cb = model_management.cast_to(
+            fsq_layer.implicit_codebook,
+            device=device,
+            dtype=dtype,
+        )
+
+        # 2. Project all 64,000 codes into the 2048D semantic space
+        valid_6d = implicit_cb * scale
+        # Shape: [64000, 2048] (~500MB VRAM at float32)
+        return quantizer.project_out(valid_6d), implicit_cb, scale
+
     @classmethod
     def deconstruct(
         cls,
@@ -213,19 +244,11 @@ class DeconstructedHints(NamedTuple):
         if dtype is not None and dtype != orig_dtype:
             hints_5hz = hints_5hz.to(dtype=dtype)
 
-        fsq_layer = quantizer.layers[0]
-        scale = quantizer.scales[0].to(dtype=dtype, device=device)
-
-        # 1. Grab the pure [-1, 1] continuous coordinates for all 64,000 possible codes
-        implicit_cb = model_management.cast_to(
-            fsq_layer.implicit_codebook,
+        valid_2048d, implicit_cb, scale = cls.get_codebook_parts(
+            model,
             device=device,
             dtype=dtype,
         )
-
-        # 2. Project all 64,000 codes into the 2048D semantic space
-        valid_6d = implicit_cb * scale
-        valid_2048d = quantizer.project_out(valid_6d)  # Shape: [64000, 2048]
 
         batch, sequence, dims = hints_5hz.shape
         hints_flat = hints_5hz.reshape(batch * sequence, dims)
@@ -237,7 +260,9 @@ class DeconstructedHints(NamedTuple):
         )
 
         # 3. Find the closest valid codebook item for every frame
-        # We process in chunks to prevent VRAM spikes (512 * 64k is tiny)
+        # We process in chunks to prevent VRAM spikes (512 * 64k is tiny).
+        # Searching 64K codes might sound scary but 10min at 5hz is only
+        # a sequence size of 3,000.
         for i in range(0, batch * sequence, chunk_size):
             chunk = hints_flat[i : i + chunk_size]
 

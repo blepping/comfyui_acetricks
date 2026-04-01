@@ -6,6 +6,7 @@ import yaml
 from comfy import model_management, model_patcher, patcher_extension, samplers
 
 from ..ace_utils import LATENT_TIME_MULTIPLIER_15, DeconstructedHints, parse_audio_codes
+from ..utils import GlobalProjection
 
 
 class ModelPatchAce15Use4dLatentNode:
@@ -772,11 +773,12 @@ class Ace15LatentToAudioCodesNode:
         *,
         upsample_codes: bool,
     ) -> tuple[list[int], torch.Tensor, torch.Tensor | None]:
-        if latent.shape[1] == 2048:
+        channels = latent.shape[1]
+        if channels == 2048:
             dr = DeconstructedHints.deconstruct(model, latent.mT, dtype=torch.float32)
             indices, lm_hints_5hz = dr.indices, dr.hints_2048d
             lm_hints_5hz = lm_hints_5hz.to(dtype=latent.dtype)
-        elif latent.shape[1] == 6:
+        elif channels == 6:
             # TODO: Nuke this?
             latent = latent.mT.clamp(-1, 1)
             indices = model.tokenizer.quantizer.layers[0].codes_to_indices(latent)
@@ -786,7 +788,8 @@ class Ace15LatentToAudioCodesNode:
         mask = (indices < 64000) & (indices >= 0)
         indices = indices[mask].reshape(latent.shape[0], -1).detach().cpu().tolist()
         if upsample_codes:
-            raw_upsampled_codes = model.detokenizer(lm_hints_5hz)
+            temp = latent.mT if channels == 2048 else lm_hints_5hz
+            raw_upsampled_codes = model.detokenizer(temp)
             upsampled_codes = raw_upsampled_codes.mT.detach().float().cpu()
         else:
             upsampled_codes = None
@@ -922,3 +925,143 @@ class Ace15AudioCodesToLatentNode:
         result_5hz = {"samples": hints_5hz, "type": "ace15_lm_hints"}
         result_25hz = {"samples": hints_25hz, "type": "audio"}
         return (result_25hz, result_5hz)
+
+
+class Ace15GetGlobalProjectionNode:
+    DESCRIPTION = "For use with the Ace15LMHintsToLatentForVisualization node. See the description of that node for more information about why you might want to use this."
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("ACE15_GLOBAL_PROJECTION",)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "dimensions": (
+                    "INT",
+                    {
+                        "min": 1,
+                        "max": 2048,
+                        "default": 192,
+                        "tooltip": "If you visualize a latent or hints with this projection, this roughly translates to the height dimension.",
+                    },
+                ),
+                "multiverse_id": (
+                    "INT",
+                    {
+                        "mint": 1,
+                        "max": 0xFFFFFFFF,
+                        "default": 42,
+                        "tooltip": "AKA the seed. Not called 'seed' because of ComfyUI's annoying default behavior of auto incrementing seeds. You definitely do not want to interpret stuff a different way every time you call this. NOTE: Changing this has an effect even if you don't generate a random universe.",
+                    },
+                ),
+                "ica_iterations": (
+                    "INT",
+                    {
+                        "min": 0,
+                        "max": 256,
+                        "default": 32,
+                        "tooltip": "Uses ICA (possibly slow) to generate a better projection. Set this to 0 to disable ICA.",
+                    },
+                ),
+            },
+            "optional": {
+                "model": (
+                    "MODEL",
+                    {
+                        "tooltip": "If you don't attach a model here, a random one will be built based on the supplied seed.",
+                    },
+                ),
+            },
+        }
+
+    @classmethod
+    def go(
+        cls,
+        *,
+        dimensions: int,
+        multiverse_id: int,
+        ica_iterations: int,
+        model: object | None = None,
+    ) -> tuple[GlobalProjection]:
+        if model is not None:
+            model_management.load_model_gpu(model)
+            mmodel = model.model
+            dmodel = mmodel.diffusion_model
+            device = mmodel.device
+            dtype = mmodel.get_dtype()
+            valid_2048d = DeconstructedHints.get_codebook_parts(
+                dmodel,
+                dtype=dtype,
+                device=device,
+            )[0].to(dtype=torch.float32)
+        else:
+            valid_2048d = None
+        proj = GlobalProjection.build(
+            universe=valid_2048d,
+            seed=multiverse_id,
+            in_channels=2048,
+            out_channels=dimensions,
+            ica_iterations=ica_iterations,
+            device="cpu",
+            dtype=torch.float32,
+        ).to(dtype=torch.float32, device=model_management.intermediate_device())
+        return (proj,)
+
+
+class Ace15LMHintsToLatentForVisualizationNode:
+    DESCRIPTION = "This node takes a ACE15_LM_HINTS input with 2048 dimensions and reduces it to a more manageable size, to be used with the VisualizeLatent node. Without this, your visualization would be 2048+ pixels tall. You could just scale it, but this tries to use the model's own audio tokenizer to retain as much semantic information as possible."
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("LATENT",)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "projection": (
+                    "ACE15_GLOBAL_PROJECTION",
+                    {
+                        "tooltip": "Use the output from the Ace15GetGlobalProjection node here.",
+                    },
+                ),
+                "lm_hints": (
+                    "ACE15_LM_HINTS",
+                    {
+                        "tooltip": "This can also take a LATENT input. If you use this feature, I recommend using an project that was generated without the MODEL input connected.",
+                    },
+                ),
+                "normalize_channels": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    @classmethod
+    def go(
+        cls,
+        *,
+        projection: GlobalProjection,
+        lm_hints: dict,
+        normalize_channels: bool = True,
+    ) -> tuple[dict]:
+        samples = lm_hints["samples"]
+        if samples.ndim < 3:
+            raise ValueError("Samples (lm_hints) input must be at least 3D")
+        if samples.ndim > 3:
+            samples = samples.flatten(start_dim=2)
+        proj = projection.to(device=samples.device, dtype=samples.dtype)
+        proj_mean, proj_mat = proj.global_mean, proj.projection_matrix
+        in_channels = samples.shape[1]
+        if in_channels < proj_mat.shape[0]:
+            proj_mat = proj_mat[:in_channels, ...]
+            proj_mean = proj_mean[:in_channels, ...]
+        result = ((samples.mT - proj_mean) @ proj_mat).mT
+        if normalize_channels:
+            mins, maxs = (
+                meth(dim=-1, keepdim=True) for meth in (result.amin, result.amax)
+            )
+            denom = maxs - mins
+            denom = denom.masked_fill_(denom == 0.0, 1e-05)
+            result -= mins
+            result /= denom
+        result = result.to(device=samples.device, dtype=samples.dtype)
+        return ({"samples": result, "type": "ace15_reduced_lm_hints"},)

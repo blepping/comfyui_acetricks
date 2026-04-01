@@ -1,7 +1,9 @@
 from .ace15_nodes import (
     Ace15AudioCodesToLatentNode,
     Ace15CompressDuplicateAudioCodesNode,
+    Ace15GetGlobalProjectionNode,
     Ace15LatentToAudioCodesNode,
+    Ace15LMHintsToLatentForVisualizationNode,
     EmptyAce15LatentFromConditioningNode,
     ModelPatchAce15Use4dLatentNode,
     RawTextEncodeAce15Node,
@@ -55,6 +57,8 @@ NODE_CLASS_MAPPINGS = {
     "ACETricks Ace15LatentToAudioCodes": Ace15LatentToAudioCodesNode,
     "ACETricks Ace15AudioCodesToLatent": Ace15AudioCodesToLatentNode,
     "ACETricks Ace15LLMInference": Ace15LLMInferenceNode,
+    "ACETricks Ace15GetGlobalProjection": Ace15GetGlobalProjectionNode,
+    "ACETricks Ace15LMHintsToLatentForVisualization": Ace15LMHintsToLatentForVisualizationNode,
 }
 
 __all__ = ("NODE_CLASS_MAPPINGS",)

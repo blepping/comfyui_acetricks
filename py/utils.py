@@ -1,4 +1,5 @@
 from collections.abc import Callable
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F  # noqa: N812
@@ -179,3 +180,171 @@ class TieredBlendWrapper:
         result_flat.scatter_(dim=-1, index=indices, src=blended_flat)
 
         return result_flat.transpose(start_dim, -1).reshape(orig_shape)
+
+
+class GlobalProjection(NamedTuple):
+    # Shape: [2048, out_channels] (assuming using the Ace15 quantizer projection)
+    projection_matrix: torch.Tensor
+    # Shape: [2048]
+    global_mean: torch.Tensor
+
+    def clone(self) -> "GlobalProjection":
+        return self.__class__(
+            *(v.clone() if isinstance(v, torch.Tensor) else v for v in self),
+        )
+
+    def to(self, *args: Any, **kwargs: Any) -> "GlobalProjection":
+        return self.__class__(
+            *(
+                v.to(*args, **kwargs) if isinstance(v, torch.Tensor) else v
+                for v in self
+            ),
+        )
+
+    @classmethod
+    def build(
+        cls,
+        *,
+        universe: torch.Tensor | None = None,
+        # PCA is random, so this matters even if you don't generate
+        # a random universe.
+        seed: int = 42,
+        # In channels only used if generating a random "universe".
+        in_channels: int = 2048,
+        out_channels: int = 192,
+        ica_iterations: int = 10,
+        # device/dtype only used when generating a random universe.
+        device: str | torch.device = "cpu",
+        dtype: torch.dtype = torch.float32,
+    ) -> "GlobalProjection":
+
+        # 1. RANDOM PROJECTION FALLBACK
+        # Used if no universe is provided. Much like our real universe,
+        # there's no meaning to be found so we never PCA or ICA here.
+        if universe is None:
+            generator = torch.Generator(device=device)
+            generator.manual_seed(seed)
+
+            # Generate random projection and Orthogonalize it (QR)
+            rand_mat = torch.randn(
+                in_channels,
+                out_channels,
+                device=generator.device,
+                dtype=dtype,
+                generator=generator,
+            )
+            q_mat = torch.linalg.qr(rand_mat)[0]
+
+            return cls(
+                projection_matrix=q_mat,
+                global_mean=torch.zeros(in_channels, device=generator.device),
+            )
+        if universe.ndim != 2:
+            raise ValueError("Universe must be a 2D tensor.")
+
+        # 2. DATA-DRIVEN PROJECTIONS (PCA or ICA)
+        global_mean = universe.mean(dim=0, keepdim=True)
+        centered_universe = universe - global_mean
+
+        with torch.random.fork_rng(
+            devices=[centered_universe.device]
+            if centered_universe.device.type != "cpu"
+            else [],
+        ):
+            torch.manual_seed(seed)
+            if ica_iterations < 1:
+                # Just do PCA, Whiten the variance, and return
+                s, v = torch.pca_lowrank(centered_universe, q=out_channels)[1:]
+                # Whitening matrix for PCA (diag 1/S)
+                v_white = v / (s.unsqueeze(0) + 1e-5)
+                return cls(
+                    projection_matrix=v_white,
+                    global_mean=global_mean.squeeze(0),
+                )
+
+            # Run the full PCA -> Whiten -> ICA pipeline
+            proj_matrix = cls.ica(
+                centered_universe,
+                iterations=ica_iterations,
+                pca_rank=out_channels,
+            )
+        return cls(
+            projection_matrix=proj_matrix,
+            global_mean=global_mean.squeeze(0),
+        )
+
+    @classmethod
+    # FastICA with optional PCA input reduction.
+    def ica(
+        cls,
+        x: torch.Tensor,  # [N, C] or [B, N, C]
+        *,
+        iterations: int = 10,
+        pca_rank: int = 192,
+    ) -> torch.Tensor:
+        orig_ndim = x.ndim
+        if x.ndim == 2:
+            x = x.unsqueeze(0)
+
+        shape = x.shape
+
+        # 1. PCA Reduction Step
+        if 0 < pca_rank < shape[-1]:
+            # pca_lowrank expects 2D data, so we reshape if batched
+            x_flat = x.reshape(-1, shape[-1])
+            v_pca = torch.pca_lowrank(x_flat, pca_rank)[-1]  # [C_in, pca_rank]
+            x = x @ v_pca  # [B, N, pca_rank]
+        else:
+            v_pca = None
+
+        shape = x.shape
+
+        # 2. Whitening Step
+        x_white, w_white = cls.whiten(x)[:2]  # w_white: [B, C_pca, C_pca]
+
+        # 3. ICA Initialization
+        w_ica = (
+            torch.eye(shape[-1], device=x_white.device, dtype=x_white.dtype)
+            .expand(shape[0], -1, -1)
+            .clone()
+        )
+
+        # 4. FastICA Iterations
+        for _ in range(iterations):
+            projected = x_white @ w_ica.mT
+            g_x = projected.pow(3)
+            g_prime_x = projected.pow_(2).mul_(3)
+
+            w_new = (g_x.mT @ x_white).div_(x_white.shape[1]) - (
+                g_prime_x.mean(dim=1, keepdim=True).mT * w_ica
+            )
+
+            # SVD for symmetric orthogonalization
+            u, _s, v = torch.linalg.svd(w_new)
+            w_ica = u @ v
+
+        # 5. Assemble the final Projection Matrix
+        # Match batch dimensions: v_pca is [C_in, C_pca], w_white is [B, C_pca, C_pca]
+        if v_pca is not None:
+            # Broadcast v_pca to match the batch size
+            v_pca_b = v_pca.unsqueeze(0).expand(shape[0], -1, -1)
+            result = v_pca_b @ w_white @ w_ica.mT
+        else:
+            result = w_white @ w_ica.mT
+
+        return result.squeeze(0) if orig_ndim == 2 else result
+
+    @staticmethod
+    def whiten(
+        x: torch.Tensor,
+        *,
+        dim: int = 1,
+        eps: float = 1e-05,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mean = x.mean(dim=dim, keepdim=True)
+        x_cent = x - mean
+        cov = (x_cent.mT @ x_cent).div_(x_cent.shape[dim] - 1)
+        u, s = torch.linalg.svd(cov)[:2]
+        s += eps
+        w = u @ torch.diag_embed(1.0 / s.sqrt_()) @ u.mT
+        return x_cent @ w, w, mean
