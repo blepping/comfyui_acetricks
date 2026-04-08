@@ -281,7 +281,18 @@ class GlobalProjection(NamedTuple):
         *,
         iterations: int = 10,
         pca_rank: int = 192,
+        # Skip running iterations if the change is less than this.
+        tolerance: float = 1e-05,
+        # When using tolerance, the result has to be within the limit
+        # this many times consecutively.
+        tolerance_checks: int = 2,
+        # 0 to disable, otherwise forces the min/max item in each row
+        # to have this sign by flipping the sign of elements in that row.
+        row_maxval_polarity: int = 1,
     ) -> torch.Tensor:
+        tolerance_checks = max(1, tolerance_checks)
+        tolerance_counter = 0
+        row_maxval_polarity = min(1, max(-1, int(row_maxval_polarity)))
         orig_ndim = x.ndim
         if x.ndim == 2:
             x = x.unsqueeze(0)
@@ -311,6 +322,7 @@ class GlobalProjection(NamedTuple):
 
         # 4. FastICA Iterations
         for _ in range(iterations):
+            w_ica_prev = w_ica.clone() if tolerance > 0 else None
             projected = x_white @ w_ica.mT
             g_x = projected.pow(3)
             g_prime_x = projected.pow_(2).mul_(3)
@@ -322,7 +334,30 @@ class GlobalProjection(NamedTuple):
             # SVD for symmetric orthogonalization
             u, _s, v = torch.linalg.svd(w_new)
             w_ica = u @ v
-
+            if w_ica_prev is None:
+                continue
+            max_deviation = (
+                (1.0 - torch.diagonal(w_ica @ w_ica_prev.mT, dim1=-2, dim2=-1).abs())
+                .clamp_min_(0)
+                .max()
+                .detach()
+                .cpu()
+                .item()
+            )
+            tolerance_counter = (
+                tolerance_counter + 1 if max_deviation < tolerance else 0
+            )
+            if tolerance_counter >= tolerance_checks:
+                break
+        if row_maxval_polarity != 0:
+            max_signs = w_ica.gather(
+                -1,
+                w_ica.abs().argmax(
+                    dim=-1,
+                    keepdim=True,
+                ),
+            ).sign()
+            w_ica *= max_signs.neg_() if row_maxval_polarity < 0 else max_signs
         # 5. Assemble the final Projection Matrix
         # Match batch dimensions: v_pca is [C_in, C_pca], w_white is [B, C_pca, C_pca]
         if v_pca is not None:

@@ -167,7 +167,7 @@ class VisualizeLatentNode:
         )
         samples = latent["samples"].to(dtype=torch.float32, device="cpu")
         channels = samples.shape[1]
-        if samples.ndim == 4 and samples.chape[2] == 1:
+        if samples.ndim == 4 and samples.shape[2] == 1:
             samples = samples.squeeze(2)
         if samples.ndim == 3:
             samples = samples.unsqueeze(-2)
