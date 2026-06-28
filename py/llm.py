@@ -563,6 +563,10 @@ class ACE15LLMSamplingState(LLMSamplingState):
         forbid_prefix = kwargs.pop("tokens_forbid_prefix", None)
         custom_noise = kwargs.pop("custom_noise", None)
         custom_noise_topk = kwargs.pop("custom_noise_topk", 250)
+        custom_noise_topk_difference_mode = kwargs.pop(
+            "custom_noise_topk_difference_mode",
+            False,
+        )
         custom_noise_topk_temperature_rescaling = kwargs.pop(
             "custom_noise_topk_temperature_rescaling",
             False,
@@ -601,6 +605,7 @@ class ACE15LLMSamplingState(LLMSamplingState):
         self.custom_noise_blend_function = external.BLEND_MODES[custom_noise_blend_mode]
         self.custom_noise_blend = custom_noise_blend
         self.custom_noise_topk = custom_noise_topk
+        self.custom_noise_topk_difference_mode = custom_noise_topk_difference_mode
         self.custom_noise_topk_temperature_rescaling = (
             custom_noise_topk_temperature_rescaling
         )
@@ -616,7 +621,7 @@ class ACE15LLMSamplingState(LLMSamplingState):
             )
         self.noise_sampler = None
 
-    def _get_custom_noise_topk_std(
+    def _get_custom_noise_topk_scaled(
         self,
         logits: torch.Tensor,
         *,
@@ -637,17 +642,22 @@ class ACE15LLMSamplingState(LLMSamplingState):
         best_scores = tk_vals[:, :1]
         cutoff = best_scores - score_cutoff
 
-        # Replace garbage with NAN so we can use nanstd
-        # This handles -inf, -3.4e38, and just generally "bad" tokens
+        # Replace garbage/unviable tokens with NaN
         tk_vals[(tk_vals < cutoff) | tk_vals.isinf()] = torch.nan
 
-        topk_std = nanstd(tk_vals.to(dtype=torch.float64), dim=-1, keepdim=True)
-
-        # Edge Case: If only 1 token was valid (rest were NaNs), std is NaN.
-        # Or if std is 0 (all tokens identical).
-        # We fill nans with 0.0 or 1.0 depending on how you want to handle "single choice" scenarios.
-        # Usually if std is 0/NaN, we shouldn't inject noise that scales with it, so 0 is safe.
-        return torch.nan_to_num(topk_std, nan=0.0).to(dtype=logits.dtype)
+        if self.custom_noise_topk_difference_mode:
+            # Difference mode: Maximum valid logit minus Minimum valid logit.
+            max_vals = tk_vals[:, :1]
+            min_vals = (
+                torch.nan_to_num(tk_vals, nan=torch.inf)
+                .min(dim=-1, keepdim=True)
+                .values
+            )
+            scale_factor = max_vals - min_vals
+        else:
+            # Standard deviation mode
+            scale_factor = nanstd(tk_vals.to(dtype=torch.float64), dim=-1, keepdim=True)
+        return torch.nan_to_num(scale_factor, nan=0.0).to(dtype=logits.dtype)
 
     def _do_blend(
         self,
@@ -655,7 +665,6 @@ class ACE15LLMSamplingState(LLMSamplingState):
         logits: torch.Tensor,
         noise: torch.Tensor,
         noise_shape: torch.Size | tuple[int, ...],
-        topk_std: torch.Tensor | None,  # noqa: ARG002
         # Proxy values for -inf and +inf, this percentage of the dtype min/max values.
         ninf_proxy_multiplier: float = 0.85,
         pinf_proxy_multiplier: float = 0.85,
@@ -671,9 +680,6 @@ class ACE15LLMSamplingState(LLMSamplingState):
             self.custom_noise_blend,
         ).reshape(logits.shape)
         invalid_mask = ~result.isfinite()
-        # tqdm.write(
-        #     f"SAMPLING NOISE: shape={noise.shape} ({noise_shape}), topk std={topk_std}, noise std={noise.std(dim=-1, keepdim=True)}, noise min/max={(*noise.aminmax(dim=-1, keepdim=True),)}, valid={noise.numel() - int(invalid_mask.float().sum().item())}",
-        # )
         result[invalid_mask] = logits[invalid_mask]
         return result
 
@@ -697,23 +703,27 @@ class ACE15LLMSamplingState(LLMSamplingState):
                 normalized=self.custom_noise_normalized,
             )
             self.noise_sampler = noise_sampler
-        topk_std = self._get_custom_noise_topk_std(logits)
+        topk_scale = self._get_custom_noise_topk_scaled(logits)
         fake_sigma = logits.new_tensor(1.0)
         noise = self.noise_sampler(fake_sigma, fake_sigma * 0.5)
         noise_shape = noise.shape
         noise = noise.reshape(logits.shape)
-        if topk_std is not None:
-            if self.dynamic_noise_power != 0.0:
-                topk_std = (
-                    topk_std.abs().pow_(self.dynamic_noise_power).copysign_(topk_std)
+        if topk_scale is not None:
+            if self.custom_noise_topk_difference_mode:
+                topk_scale *= (
+                    noise.abs()
+                    .max(dim=-1, keepdim=True)
+                    .values.clamp_min_(1e-06)
+                    .reciprocal_()
                 )
-            noise *= topk_std
-        result = self._do_blend(
-            logits=logits,
-            noise=noise,
-            noise_shape=noise_shape,
-            topk_std=topk_std,
-        )
+            if self.dynamic_noise_power != 0.0:
+                topk_scale = (
+                    topk_scale.abs()
+                    .pow_(self.dynamic_noise_power)
+                    .copysign_(topk_scale)
+                )
+            noise *= topk_scale
+        result = self._do_blend(logits=logits, noise=noise, noise_shape=noise_shape)
         result = result.reshape(logits.shape[0], -1)
         return result.argmax(dim=-1).detach().cpu().tolist()
 
@@ -951,7 +961,7 @@ class Ace15LLMSampling(LLMSampling):
         *,
         tokenizer: object | None = None,
         verbose_interval: int = 0,
-        **kwargs,
+        **kwargs: Any,
     ):
         super().__init__(**kwargs)
         self.verbose_interval = verbose_interval
@@ -972,10 +982,16 @@ class Ace15LLMSampling(LLMSampling):
             and (step % self.verbose_interval) == 0
         ):
             tqdm.write(f"* LLM sampling at step {step}:")
-            for bidx, (ctoks, ntok) in enumerate(zip(current_tokens, tokens)):
+            for bidx, (ctoks, ntok) in enumerate(
+                zip(
+                    current_tokens,
+                    tokens,
+                    strict=True,
+                )
+            ):
                 tqdm.write(f"  - Batch {bidx}:")
                 decoded = self.tokenizer.decode(
-                    [*ctoks[-(self.verbose_interval - 1) :], ntok]
+                    [*ctoks[-self.verbose_interval :], ntok]
                 )
                 tqdm.write(decoded)
             tqdm.write("###### END LLM sampling output ######\n")
