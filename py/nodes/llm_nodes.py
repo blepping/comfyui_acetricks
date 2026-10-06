@@ -2,7 +2,7 @@ from functools import partial
 
 import yaml
 
-from ..llm import Ace15LLMSampling, ACE15LLMSamplingState
+from ..llm import ACE15LLMSamplingState, LLMSampling
 
 
 class Ace15LLMInferenceNode:
@@ -60,7 +60,7 @@ sampling_parameters:
     repetition_penalty: 0.0
     # Windows count from the beginning if positive, or the end if negative.
     # I.E. -128 means consider at most the last 128 tokens.
-    repetetion_penalty_window: null
+    repetition_penalty_window: null
     # N-grams - sequences of however many tokens.
     no_repeat_ngram_size: 0
     no_repeat_ngram_penalty: -.inf
@@ -158,7 +158,8 @@ sampling_parameters:
                     {
                         "dynamicPrompts": False,
                         "multiline": True,
-                        "tooltip": "Prevents the output from starting with these tokens if connected. For example, if we have tokens 'A B C' here then the model can't generate 'A B C whatever' or 'X B C whatever', however it could generate 'X A B C whatever'. In other words, it bans the token from existing in that slot.",
+                        "tooltip": "WIP, not currently functional.",
+                        # "tooltip": "Prevents the output from starting with these tokens if connected. For example, if we have tokens 'A B C' here then the model can't generate 'A B C whatever' or 'X B C whatever', however it could generate 'X A B C whatever'. In other words, it bans the token from existing in that slot.",
                     },
                 ),
             },
@@ -215,7 +216,7 @@ sampling_parameters:
         else:
             tokens_neg = None
         clip_metadata = {
-            "lm_prompt": list((t, 1.0) for t in tokens),
+            "lm_prompt": [(t, 1.0) for t in tokens],
             "lm_metadata": {"min_tokens": minimum_tokens},
         }
         csm = clip.cond_stage_model
@@ -241,7 +242,7 @@ sampling_parameters:
             raise ValueError(
                 "Couldn't determine EOS token id. You may be using an unsupported model.",
             )
-        llm_sampler = Ace15LLMSampling(
+        llm_sampler = LLMSampling(
             verbose_interval=verbose_interval,
             tokenizer=tokenizer,
             model=model,

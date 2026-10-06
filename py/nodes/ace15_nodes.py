@@ -1,11 +1,16 @@
 import itertools
-from typing import Any, NamedTuple
+from typing import Any
 
 import torch
 import yaml
 from comfy import model_management, model_patcher, patcher_extension, samplers
 
-from ..ace_utils import LATENT_TIME_MULTIPLIER_15, DeconstructedHints, parse_audio_codes
+from ..ace_utils import (
+    LATENT_TIME_MULTIPLIER_15,
+    DeconstructedHints,
+    get_ace15_silence_latent,
+    parse_audio_codes,
+)
 from ..utils import GlobalProjection
 
 
@@ -181,6 +186,19 @@ class EmptyAce15LatentFromConditioningNode:
                         "tooltip": "Will trigger an error if there aren't enough audio codes to reach the specified duration.",
                     },
                 ),
+                "empty_mode": (
+                    ("zeros", "silence"),
+                    {
+                        "default": "silence",
+                        "tooltip": "Controls whether the empty latent or padding gets filled with zeros or the latent representation of silent audio.",
+                    },
+                ),
+                "latent": (
+                    "LATENT",
+                    {
+                        "tooltip": "Optional latent input. If supplied, it will be trimmed or padded to match the audio codes. This node can handle a 4D unsqueezed latent and if supplied, the output will also be 4D.",
+                    },
+                ),
             },
         }
 
@@ -191,6 +209,8 @@ class EmptyAce15LatentFromConditioningNode:
         conditioning: list,
         batch_size: int = 1,
         minimum_duration: float = 0.0,
+        empty_mode: str = "silence",
+        latent: dict | None = None,
     ) -> tuple:
         n_codes = 0
         for _, d in conditioning:
@@ -207,9 +227,57 @@ class EmptyAce15LatentFromConditioningNode:
             errstr = f"{n_codes} 5hz code(s) ({duration:.3f} second(s)) doesn't match the minimum of {minimum_duration:.3f}."
             raise ValueError(errstr)
         device = model_management.intermediate_device()
+        dtype = model_management.intermediate_dtype()
         temporal_length = int(duration * LATENT_TIME_MULTIPLIER_15)
-        latent = torch.zeros(batch_size, 64, temporal_length, device=device)
-        return ({"samples": latent, "type": "audio"},)
+        if latent is not None:
+            ref_latent = latent["samples"]
+            ref_shape = ref_latent.shape
+            if ref_latent.ndim not in {3, 4}:
+                raise ValueError("Reference latent must be 3D or 4D")
+            if not (
+                (ref_latent.ndim == 3 and ref_shape[1] == 64)
+                or ref_shape[1:3] == (64, 1)
+            ):
+                errstr = f"Unexpected latent shape {ref_shape} - must be a 3D or 4D ACE-Step 1.5 latent."
+                raise ValueError(errstr)
+            if ref_latent.ndim == 4:
+                ref_latent = ref_latent.squeeze(-2)
+            ref_big_enough = ref_shape[-1] >= temporal_length
+        else:
+            ref_latent = ref_shape = None
+            ref_big_enough = False
+        if not ref_big_enough:
+            samples = (
+                torch.expand_copy(
+                    get_ace15_silence_latent(
+                        temporal_length,
+                        device=device,
+                    ).to(dtype=dtype),
+                    (batch_size, -1, -1),
+                )
+                if empty_mode == "silence"
+                else torch.zeros(
+                    batch_size,
+                    64,
+                    temporal_length,
+                    device=device,
+                    dtype=dtype,
+                )
+            )
+            if ref_latent is not None:
+                samples[..., : ref_shape[-1]] = ref_latent
+        else:
+            samples = ref_latent[..., :temporal_length].to(
+                device=device,
+                dtype=dtype,
+            )
+            if samples.shape[0] < batch_size:
+                samples = torch.expand_copy(samples, (batch_size, -1, -1))
+            else:
+                samples = samples.clone()
+        if ref_latent is not None and ref_latent.ndim == 4:
+            samples = samples.unsqueeze(-2)
+        return ({"samples": samples, "type": "audio"},)
 
 
 class Ace15CompressDuplicateAudioCodesNode:
@@ -908,9 +976,11 @@ class Ace15AudioCodesToLatentNode:
         device = mmodel.device
         codes_tensor = torch.tensor((audio_codes,), dtype=torch.int64, device=device)
         quantizer = dmodel.tokenizer.quantizer
-        hints_5hz = quantizer.get_output_from_indices(codes_tensor).to(
-            dtype=torch.float32,
-        )
+        hints_5hz = quantizer.get_output_from_indices(codes_tensor)
+        # model_dtype = hints_5hz.dtype
+        # hints_5hz = quantizer.get_output_from_indices(codes_tensor).to(
+        #     dtype=torch.float32,
+        # )
         hints_5hz = DeconstructedHints.deconstruct(dmodel, hints_5hz).hints_2048d
         hints_25hz = dmodel.detokenizer(hints_5hz)
         hints_5hz, hints_25hz = (

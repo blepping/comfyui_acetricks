@@ -10,8 +10,24 @@ from comfy import model_management
 from comfy import utils as comfy_utils
 from tqdm import tqdm
 
+try:
+    from comfy.text_encoders import yue2
+except (ImportError, ModuleNotFoundError):
+    yue2 = None
+
 from . import external
 from .utils import TieredBlendWrapper, nanstd
+
+
+def get_token_idxs(tokens: Sequence[int], *args: int) -> tuple[int | None, ...]:
+    result = []
+    tokens = tuple(tokens)
+    for tid in args:
+        try:
+            result.append(tokens.index(tid))
+        except ValueError:  # noqa: PERF203
+            result.append(None)
+    return tuple(result)
 
 
 class WindowedLogitsProcessor(transformers.LogitsProcessor):
@@ -88,6 +104,8 @@ class BiasTokenIdsLogitsProcessor(transformers.LogitsProcessor):
             return scores.clone()
         mask = self._get_mask(scores.shape[-1], device=scores.device)
         mask = mask.reshape(*((1,) * (scores.ndim - 1)), -1)
+        if not math.isfinite(self.bias_value):
+            return scores.masked_fill(mask, self.bias_value)
         adjusted_scores = (
             scores + self.bias_value if self.add_bias else scores * self.bias_value
         )
@@ -140,6 +158,7 @@ class RepetitionPenaltyExtLogitsProcessor(WindowedLogitsProcessor):
         return self.processor(input_ids, scores)
 
 
+# FIXME: This does not currently work properly.
 class ForbidPrefixLogitsProcessor(transformers.LogitsProcessor):
     def __init__(self, prefix: list[int] | tuple[int, ...]):
         super().__init__()
@@ -517,7 +536,7 @@ class LLMSamplingState:
             )
         if self.temperature != 1.0:
             lp_list.append(
-                transformers.TemperatureLogitsWarper(temperature=self.temperature)
+                transformers.TemperatureLogitsWarper(temperature=self.temperature),
             )
         if self.top_k > 0:
             lp_list.append(transformers.TopKLogitsWarper(top_k=self.top_k))
@@ -557,10 +576,9 @@ class LLMSamplingState:
         return self.sample(logits)
 
 
-class ACE15LLMSamplingState(LLMSamplingState):
+class CustomNoiseLLMSamplingState(LLMSamplingState):
     def __init__(self, *args: Any, **kwargs: Any):
-        ace15_audio_only = kwargs.pop("ace15_audio_only", None)
-        forbid_prefix = kwargs.pop("tokens_forbid_prefix", None)
+        external.ensure_blend_modes()
         custom_noise = kwargs.pop("custom_noise", None)
         custom_noise_topk = kwargs.pop("custom_noise_topk", 250)
         custom_noise_topk_difference_mode = kwargs.pop(
@@ -577,23 +595,6 @@ class ACE15LLMSamplingState(LLMSamplingState):
         custom_noise_blend = kwargs.pop("custom_noise_blend", 1.0)
         custom_noise_blend_tiers = kwargs.pop("custom_noise_blend_tiers", 0)
         super().__init__(*args, **kwargs)
-        if ace15_audio_only is not None:
-            if bool(ace15_audio_only):
-                start_id, end_id = 151669, 215669
-            else:
-                start_id, end_id = 0, 151668
-            self.logits_processors.insert(
-                1,
-                BiasTokenIdsLogitsProcessor(
-                    ranges=(
-                        (self.eos_token_id, self.eos_token_id),
-                        (start_id, end_id),
-                    ),
-                ),
-            )
-        if forbid_prefix:
-            # Shouldn't matter if this is before or after token biasing.
-            self.logits_processors.insert(1, ForbidPrefixLogitsProcessor(forbid_prefix))
         self.custom_noise = custom_noise
         if custom_noise is None:
             return
@@ -669,7 +670,6 @@ class ACE15LLMSamplingState(LLMSamplingState):
         ninf_proxy_multiplier: float = 0.85,
         pinf_proxy_multiplier: float = 0.85,
     ) -> torch.Tensor:
-        invalid_mask = ~(logits.isfinite() & noise.isfinite())
         finfo = torch.finfo(noise.dtype)
         ninf_proxy = finfo.min * ninf_proxy_multiplier
         pinf_proxy = finfo.max * pinf_proxy_multiplier
@@ -680,7 +680,7 @@ class ACE15LLMSamplingState(LLMSamplingState):
             self.custom_noise_blend,
         ).reshape(logits.shape)
         invalid_mask = ~result.isfinite()
-        result[invalid_mask] = logits[invalid_mask]
+        result = torch.where(invalid_mask, logits, result)
         return result
 
     def sample(self, logits: torch.Tensor) -> list[int]:
@@ -726,6 +726,30 @@ class ACE15LLMSamplingState(LLMSamplingState):
         result = self._do_blend(logits=logits, noise=noise, noise_shape=noise_shape)
         result = result.reshape(logits.shape[0], -1)
         return result.argmax(dim=-1).detach().cpu().tolist()
+
+
+class ACE15LLMSamplingState(CustomNoiseLLMSamplingState):
+    def __init__(self, *args: Any, **kwargs: Any):
+        ace15_audio_only = kwargs.pop("ace15_audio_only", None)
+        forbid_prefix = kwargs.pop("tokens_forbid_prefix", None)
+        super().__init__(*args, **kwargs)
+        if ace15_audio_only is not None:
+            if bool(ace15_audio_only):
+                start_id, end_id = 151669, 215669
+            else:
+                start_id, end_id = 0, 151668
+            self.logits_processors.insert(
+                1,
+                BiasTokenIdsLogitsProcessor(
+                    ranges=(
+                        (self.eos_token_id, self.eos_token_id),
+                        (start_id, end_id),
+                    ),
+                ),
+            )
+        if forbid_prefix:
+            # Shouldn't matter if this is before or after token biasing.
+            self.logits_processors.insert(1, ForbidPrefixLogitsProcessor(forbid_prefix))
 
 
 class ModelLLM:
@@ -824,6 +848,7 @@ class ModelLLM:
         ids: Sequence[Sequence[int]],
         *,
         min_tokens: int = 1,
+        max_tokens: int = 32767,
         reset_state: bool = True,
     ):
         device = self.device
@@ -868,10 +893,11 @@ class ModelLLM:
             )
 
 
-class LLMSampling:
-    def __init__(self, *, model: object, state_class: type):
+class BaseLLMSampling:
+    def __init__(self, *, model: object, state_class: type, llm_class: type = ModelLLM):
         self.model = model
         self.state_class = state_class
+        self.llm_class = llm_class
 
     def token_output(
         self,
@@ -895,7 +921,7 @@ class LLMSampling:
         if not ids:
             return []
 
-        llm = ModelLLM(
+        llm = self.llm_class(
             model=self.model,
             execution_dtype=execution_dtype,
         )
@@ -905,7 +931,7 @@ class LLMSampling:
             max_tokens=max_tokens,
         )
 
-        llm_gen = llm(ids, min_tokens=min_tokens)
+        llm_gen = llm(ids, max_tokens=max_tokens, min_tokens=min_tokens)
         progress_bar = comfy_utils.ProgressBar(max_tokens) if progress else None
         step_iter = (
             comfy_utils.model_trange(max_tokens, desc="LM sampling")
@@ -955,7 +981,7 @@ class LLMSampling:
         return output_tokens
 
 
-class Ace15LLMSampling(LLMSampling):
+class LLMSampling(BaseLLMSampling):
     def __init__(
         self,
         *,
@@ -987,11 +1013,11 @@ class Ace15LLMSampling(LLMSampling):
                     current_tokens,
                     tokens,
                     strict=True,
-                )
+                ),
             ):
                 tqdm.write(f"  - Batch {bidx}:")
                 decoded = self.tokenizer.decode(
-                    [*ctoks[-self.verbose_interval :], ntok]
+                    [*ctoks[-self.verbose_interval :], ntok],
                 )
                 tqdm.write(decoded)
             tqdm.write("###### END LLM sampling output ######\n")

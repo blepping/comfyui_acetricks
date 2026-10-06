@@ -31,6 +31,7 @@ from .latent_nodes import (
 )
 from .llm_nodes import Ace15LLMInferenceNode
 from .misc_nodes import MaskNode, TimeOffsetNode
+from .yue2_nodes import RawTextEncodeYuE2Node, YuE2LLMInferenceNode
 
 NODE_CLASS_MAPPINGS = {
     "ACETricks SilentLatent": SilentLatentNode,
@@ -57,6 +58,8 @@ NODE_CLASS_MAPPINGS = {
     "ACETricks Ace15LatentToAudioCodes": Ace15LatentToAudioCodesNode,
     "ACETricks Ace15AudioCodesToLatent": Ace15AudioCodesToLatentNode,
     "ACETricks Ace15LLMInference": Ace15LLMInferenceNode,
+    "ACETricks YuE2LLMInference": YuE2LLMInferenceNode,
+    "ACETricks RawTextEncodeYuE2": RawTextEncodeYuE2Node,
     "ACETricks Ace15GetGlobalProjection": Ace15GetGlobalProjectionNode,
     "ACETricks Ace15LMHintsToLatentForVisualization": Ace15LMHintsToLatentForVisualizationNode,
 }
