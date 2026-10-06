@@ -247,7 +247,7 @@ Your lyrics
                     },
                 ),
                 "custom_noise": (
-                    ("SONAR_CUSTOM_NOISE,OCS_CUSTOM_NOISE"),
+                    ("SONAR_CUSTOM_NOISE,OCS_NOISE"),
                     {
                         "tooltip": "Optional custom noise input for temperature sampling. Can take custom noise inputs from my ComfyUI-Sonar and comfyui_overly_complicated_sampling node packs. Note: You will probably want to use a noise factor around 0.4 to 0.6 and also make sure that the noise is normalized. This will not work well with noise samplers that care about the sigma.",
                     },
