@@ -349,6 +349,7 @@ Your lyrics
                 if start_idx is None:
                     errstr = f"Output mode is {output_mode} but start token of that type missing"
                     raise RuntimeError(errstr)
+                output_tokens = output_tokens[start_idx + 1 :]
 
         decoded_outputs = tokenizer.decode(output_tokens)
         return (decoded_outputs,)
