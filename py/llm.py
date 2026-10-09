@@ -135,6 +135,8 @@ class NoRepeatNGramExtLogitsProcessor(WindowedLogitsProcessor):
 
         # Transformers logits processors don't do in-place operations, so this is safe.
         processed_scores = self.processor(input_ids, scores)
+        if self.penalty == -math.inf:
+            return processed_scores
         # The Transformers logits processor either penalizes by -inf or does nothing.
         mask = scores != processed_scores
         processed_scores = (

@@ -126,7 +126,7 @@ class MERT2TokenizerAudioEncoderModel(audio_encoders.AudioEncoderModel):
 
     def get_mert2_feats(self, *, waveform: torch.Tensor) -> torch.Tensor:
         encoder = self.model.mert2_encoder
-        sr, fps = 25.0, self.model_sample_rate
+        sr, fps = self.model_sample_rate, 25.0
         duration = waveform.shape[-1] / sr
         if duration <= 300.0:
             return encoder(encoder.feature_extractor(waveform), n_layers=20)
