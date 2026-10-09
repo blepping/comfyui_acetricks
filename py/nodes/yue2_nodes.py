@@ -1,13 +1,15 @@
 from functools import partial
 
+import folder_paths
 import torch
 import yaml
 from comfy import model_management
 from tokenizers import AddedToken
 
-from ..external import ensure_blend_modes
+from .. import external
 from ..llm import LLMSampling, get_token_idxs
 from ..llm_yue2 import ModelYuE2LLM, YuE2LLMSamplingState, yue2
+from ..yue2_support import MERT2TokenizerAudioEncoderModel
 
 
 def get_yue2_tokenizer(clip: object) -> object:
@@ -268,7 +270,7 @@ Your lyrics
         llm_prompt_negative: str | None = None,
         custom_noise: object | None = None,
     ) -> tuple:
-        ensure_blend_modes()
+        external.ensure_blend_modes()
         params = yaml.safe_load(yaml_params)
         if not isinstance(params, dict):
             raise TypeError("yaml_params must be a YAML object")
@@ -303,8 +305,25 @@ Your lyrics
         else:
             eos_token_id = yue2.ABC_END
 
+        hidden_cfg_scale = sampling_params.pop("hidden_cfg_scale", 1.0)
+        hidden_cfg_blend_mode = (
+            sampling_params.pop("hidden_cfg_blend_mode", None)
+            if hidden_cfg_scale != 1
+            else None
+        )
+        hidden_cfg_blend_function = (
+            torch.lerp
+            if hidden_cfg_blend_mode is None
+            else external.BLEND_MODES[hidden_cfg_blend_mode]
+        )
+        hidden_cfg_cond = bool(sampling_params.pop("hidden_cfg_cond", True))
         cfg_scale = sampling_params.get("cfg_scale", 1.0)
-        if cfg_scale != 1.0:
+        if not hidden_cfg_cond and cfg_scale == 1:
+            raise ValueError(
+                "Disabling hidden_cfg_cond with cfg_scale==1 doesn't make sense",
+            )
+        using_cfg = cfg_scale != 1 or hidden_cfg_scale != 1
+        if using_cfg:
             if llm_prompt_negative is None:
                 raise ValueError(
                     "Must provide negative prompt when cfg_scale is not 1.0",
@@ -314,7 +333,7 @@ Your lyrics
             tokens_neg = None
         clip_metadata = {
             "cot": "off",
-            "cfg_scale": cfg_scale,
+            "cfg_scale": 2.0 if using_cfg else 1.0,
             "max_tokens": maximum_tokens,
             "prefix": [(t, 1.0) for t in tokens],
         }
@@ -325,7 +344,13 @@ Your lyrics
             verbose_interval=verbose_interval,
             tokenizer=tokenizer,
             model=csm,
-            llm_class=ModelYuE2LLM,
+            llm_class=partial(
+                ModelYuE2LLM,
+                logits_cfg_scale=cfg_scale,
+                hidden_cfg_scale=hidden_cfg_scale,
+                hidden_cfg_blend_function=hidden_cfg_blend_function,
+                hidden_cfg_cond=hidden_cfg_cond,
+            ),
             state_class=partial(
                 YuE2LLMSamplingState,
                 audio_only=eos_token_id == yue2.MUSIC_END,
@@ -353,3 +378,80 @@ Your lyrics
 
         decoded_outputs = tokenizer.decode(output_tokens)
         return (decoded_outputs,)
+
+
+class LoadYuE2TokenizerAudioEncoderNode:
+    DESCRIPTION = "TBD"
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("AUDIO_ENCODER",)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        encoders_list = folder_paths.get_filename_list("audio_encoders")
+        return {
+            "required": {
+                "mert2_fullsong": (
+                    encoders_list,
+                    {
+                        "default": "mert2_fullsong.safetensors",
+                    },
+                ),
+                "tokenizer_head": (
+                    encoders_list,
+                    {
+                        "default": "tokenizer_head_joint_v9.safetensors",
+                    },
+                ),
+            },
+        }
+
+    @classmethod
+    def go(
+        cls,
+        *,
+        mert2_fullsong: str,
+        tokenizer_head: str,
+    ) -> tuple[MERT2TokenizerAudioEncoderModel]:
+        mert2_fullsong, tokenizer_head = (
+            folder_paths.get_full_path_or_raise("audio_encoders", fn)
+            for fn in (mert2_fullsong, tokenizer_head)
+        )
+        audio_encoder = MERT2TokenizerAudioEncoderModel.load_audioencoder(
+            mert2_path=mert2_fullsong,
+            tokenizer_head_path=tokenizer_head,
+        )
+        return (audio_encoder,)
+
+
+class YuE2AudioToCodesNode:
+    DESCRIPTION = "TBD"
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("STRING",)
+    OUTPUT_IS_LIST = (True,)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "audio_encoder": ("AUDIO_ENCODER",),
+                "audio": ("AUDIO",),
+            },
+        }
+
+    @classmethod
+    def go(cls, *, audio_encoder: object, audio: dict) -> tuple[list[str]]:
+        if not isinstance(audio_encoder, MERT2TokenizerAudioEncoderModel):
+            raise ValueError(  # noqa: TRY004
+                "Unexpected audio encoder. Use the LoadYuE2TokenizerAudioEncoder node to load the audio encoder.",
+            )
+        codes = audio_encoder.audio_to_yue2_codes(
+            waveform=audio["waveform"],
+            sample_rate=audio["sample_rate"],
+        ).to(device="cpu", dtype=torch.int32)
+        result = [
+            "".join(f"<|audio_code_{code}|>" for code in batch_item)
+            for batch_item in codes.tolist()
+        ]
+        return (result,)

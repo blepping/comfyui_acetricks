@@ -1,4 +1,4 @@
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import torch
@@ -18,8 +18,16 @@ class ModelYuE2LLM:
         pad_token: int | None = None,
         eos_token: int | None = None,
         device: torch.device | str | None = None,
+        hidden_cfg_blend_function: Callable = torch.lerp,
+        hidden_cfg_scale: float = 1.0,
+        hidden_cfg_cond: bool = True,
+        logits_cfg_scale: float = 1.0,
     ):
         self.model = model
+        self.logits_cfg_scale = logits_cfg_scale
+        self.hidden_cfg_cond = hidden_cfg_cond
+        self.hidden_cfg_scale = hidden_cfg_scale
+        self.hidden_cfg_blend_function = hidden_cfg_blend_function
         special_tokens = getattr(model, "special_tokens", {})
         self.pad_token = 0
         self.eos_token = (
@@ -74,7 +82,6 @@ class ModelYuE2LLM:
         max_tokens: int = 32776,
         reset_state: bool = True,
     ):
-
         device = self.device
         dtype = self.dtype
         self.prepare(
@@ -83,6 +90,8 @@ class ModelYuE2LLM:
             max_tokens=max_tokens,
             reset_state=reset_state,
         )
+        if self.logits is None:
+            raise RuntimeError
         fixed_kv = isinstance(self.kv_cache[0], FixedKV)
         step = 0
         decode_tokens = torch.empty(
@@ -111,6 +120,8 @@ class ModelYuE2LLM:
             decode_buffers = None
         use_attn_mask = self.attention_mask is not None and not fixed_kv
         mask = self.attention_mask
+        hidden_cfg = self.hidden_cfg_scale
+        cfg_cond = not self.hidden_cfg_cond
 
         try:
             while True:
@@ -132,8 +143,33 @@ class ModelYuE2LLM:
                     decode_buffers=decode_buffers,
                 )
                 self.kv_cache = output[2]
-                self.logits.copy_(model.lm_head(output[0][:, -1]))
-                del output
+                hidden = output[0][:, -1]
+                if hidden_cfg != 1:
+                    hidden_guided = self.hidden_cfg_blend_function(
+                        hidden[1 if cfg_cond else 0][None],
+                        hidden[0 if cfg_cond else 1][None],
+                        hidden_cfg,
+                    )
+                    if self.logits_cfg_scale != 1:
+                        hidden = torch.cat(
+                            (hidden_guided, hidden[1][None])
+                            if cfg_cond
+                            else (hidden[0][None], hidden_guided),
+                            dim=0,
+                        )
+                    else:
+                        hidden = hidden_guided
+                    del hidden_guided
+                logits = model.lm_head(hidden)
+                self.logits.copy_(logits)
+                # if logits.shape[0] < self.logits.shape[0]:
+                #     self.logits[:1].copy_(logits[0])
+                #     if logits.shape[0] == 1 and self.logits.shape[0] == 2:
+                #         self.logits[1:2].copy_(logits[0])
+                # else:
+                #     self.logits.copy_(logits)
+                # self.logits.copy_(model.lm_head(hidden))
+                del output, hidden, logits
                 if fixed_kv:
                     model_prefetch.malloc_graph_end()
                 positions += 1

@@ -1,6 +1,9 @@
+import contextlib
+
 import torch
 
 from ..ace_utils import LATENT_TIME_MULTIPLIER, LATENT_TIME_MULTIPLIER_15
+from ..utils import parse_audio_codes
 
 
 class TimeOffsetNode:
@@ -110,3 +113,92 @@ class MaskNode:
         )
         mask[:, start_freq : end_freq + 1, offs_start : offs_end + 1] = strength
         return (mask,)
+
+
+class CutAudioCodesNode:
+    DESCRIPTION = (
+        "Can be used to select a range of audio codes based on time or indexes."
+    )
+    FUNCTION = "go"
+    CATEGORY = "audio/acetricks"
+    RETURN_TYPES = ("STRING",)
+
+    @classmethod
+    def INPUT_TYPES(cls) -> dict:
+        return {
+            "required": {
+                "framerate_hz": (
+                    "STRING",
+                    {
+                        "default": "ace15",
+                        "tooltip": "Used when setting a time-based time_mode. ACE-Step 1.5 uses 5hz (5.0), YuE2 uses 25hz (25.0). You may also enter a preset name. Available presets: ace15, yue2",
+                    },
+                ),
+                "audio_codes": ("STRING",),
+                "time_mode": (
+                    ("seconds", "index"),
+                    {
+                        "default": "seconds",
+                    },
+                ),
+                "start": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "max": 99999.0,
+                        "min": -99999.0,
+                    },
+                ),
+                "end": (
+                    "FLOAT",
+                    {
+                        "default": -1.0,
+                        "max": 99999.0,
+                        "min": -99999.0,
+                    },
+                ),
+            },
+        }
+
+    @classmethod
+    def go(
+        cls,
+        *,
+        framerate_hz: str,
+        audio_codes: str,
+        time_mode: str,
+        start: float,
+        end: float,
+    ) -> tuple[str]:
+        framerate_hz = framerate_hz.strip().lower()
+        time_mode = time_mode.strip().lower()
+        if time_mode not in {"seconds", "index"}:
+            raise ValueError("Bad time_mode")
+        presets = {
+            "ace15": 5.0,
+            "yue2": 25.0,
+        }
+        fr = presets.get(framerate_hz)
+        if fr is None and framerate_hz:
+            with contextlib.suppress(ValueError):
+                fr = float(framerate_hz)
+        if fr is None or fr <= 0:
+            raise ValueError(
+                "Bad format for framerate_hz. Must either be a preset or positive non-zero floating point value",
+            )
+        codes = parse_audio_codes(audio_codes, n_codes=0)
+        n_codes = len(codes)
+        if time_mode == "seconds":
+            start, end = (
+                round(tval * fr) + n_codes * int(tval < 0) for tval in (start, end)
+            )
+        else:
+            # index mode handling
+            start, end = (
+                int(tval if tval >= 0 else n_codes + tval) for tval in (start, end)
+            )
+        print(f"CODES: start={start}, end={end}, n_codes={n_codes}")
+        if not (start < end and all(0 <= tval < n_codes for tval in (start, end))):
+            raise ValueError("Time out of range or start is greater than end")
+        codes = "".join(f"<|audio_code_{c}|>" for c in codes[start:end])
+        return (codes,)

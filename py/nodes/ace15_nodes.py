@@ -9,9 +9,8 @@ from ..ace_utils import (
     LATENT_TIME_MULTIPLIER_15,
     DeconstructedHints,
     get_ace15_silence_latent,
-    parse_audio_codes,
 )
-from ..utils import GlobalProjection
+from ..utils import GlobalProjection, parse_audio_codes
 
 
 class ModelPatchAce15Use4dLatentNode:
