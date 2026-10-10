@@ -52,7 +52,7 @@ def fixup_waveform(
 def parse_audio_codes(
     audio_codes: str | Sequence[int] | None,
     *,
-    n_codes: int = 64000,
+    codebook_size: int = 64000,
 ) -> tuple[int, ...]:
     if audio_codes is None:
         return ()
@@ -86,10 +86,10 @@ def parse_audio_codes(
     else:
         audio_codes = tuple(audio_codes)
     if not all(
-        isinstance(ac, int) and (n_codes < 1 or (0 <= ac < n_codes))
+        isinstance(ac, int) and (codebook_size < 1 or (0 <= ac < codebook_size))
         for ac in audio_codes
     ):
-        errstr = f"Audio codes must parse to integer values >= 0 and < {n_codes} (if {n_codes} is non-zero)."
+        errstr = f"Audio codes must parse to integer values >= 0 and < {codebook_size} (if {codebook_size} is non-zero)."
         raise ValueError(errstr)
     return audio_codes
 

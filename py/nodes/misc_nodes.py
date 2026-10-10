@@ -121,7 +121,17 @@ class CutAudioCodesNode:
     )
     FUNCTION = "go"
     CATEGORY = "audio/acetricks"
-    RETURN_TYPES = ("STRING",)
+    RETURN_TYPES = ("STRING", "INT", "INT", "INT", "INT", "FLOAT", "FLOAT", "FLOAT")
+    RETURN_NAMES = (
+        "parsed_codes",
+        "input_length",
+        "output_length",
+        "start_index",
+        "end_index",
+        "time",
+        "start_time",
+        "end_time",
+    )
 
     @classmethod
     def INPUT_TYPES(cls) -> dict:
@@ -131,30 +141,47 @@ class CutAudioCodesNode:
                     "STRING",
                     {
                         "default": "ace15",
+                        "placeholder": "Enter hz or a preset: ace15, yue2",
                         "tooltip": "Used when setting a time-based time_mode. ACE-Step 1.5 uses 5hz (5.0), YuE2 uses 25hz (25.0). You may also enter a preset name. Available presets: ace15, yue2",
                     },
                 ),
-                "audio_codes": ("STRING",),
+                "audio_codes": (
+                    "STRING",
+                    {
+                        "forceInput": True,
+                        "tooltip": "Input audio codes. This can handle a comma-seperated list of integers or audio codes (with no delimiter) in the format <|audio_code_123|>. The node will look for the audio code prefix first (and other preceding text will be ignored). If it can't find the prefix, it will try to parse as a comma-separated list of integers. In other words, leading non-code text is fine if the input is audio codes, otherwise it must be a list of integers separated by commas.",
+                    },
+                ),
                 "time_mode": (
-                    ("seconds", "index"),
+                    ("seconds", "index", "percent"),
                     {
                         "default": "seconds",
+                        "tooltip": "seconds - interpret the start/end parameters based on framerate_hz.\nindex - interpret the start/end parameters as absolute (integer) indexes.\npercent - interpret start/end as a percentage of the total codes length.",
                     },
                 ),
                 "start": (
                     "FLOAT",
                     {
                         "default": 0.0,
-                        "max": 99999.0,
-                        "min": -99999.0,
+                        "max": 999999.0,
+                        "min": -999999.0,
+                        "tooltip": "Negative values count from the end. This is clamped to the valid range.",
                     },
                 ),
                 "end": (
                     "FLOAT",
                     {
-                        "default": -1.0,
-                        "max": 99999.0,
-                        "min": -99999.0,
+                        "default": 999999.0,
+                        "max": 999999.0,
+                        "min": -999999.0,
+                        "tooltip": "Negative values count from the end. This is clamped to the valid range.",
+                    },
+                ),
+                "output_mode": (
+                    ("tokens", "integers_commasep", "integers_spacesep", "json"),
+                    {
+                        "default": "tokens",
+                        "tooltip": "tokens - Outputs a sequence of <|audio_code_123|> tokens.\nintegers_commasep - outputs a sequence of comma-separated integers.\nintegers_commasep - outputs a sequence of space-delimited integers.\njson - same as integers_commasep except it will add square brackets around the result to turn it into a valid JSON (or Python) list.",
                     },
                 ),
             },
@@ -169,36 +196,80 @@ class CutAudioCodesNode:
         time_mode: str,
         start: float,
         end: float,
-    ) -> tuple[str]:
+        output_mode: str,
+    ) -> tuple[str, int, int, int, int, float, float, float]:
         framerate_hz = framerate_hz.strip().lower()
         time_mode = time_mode.strip().lower()
-        if time_mode not in {"seconds", "index"}:
+        output_mode = output_mode.strip().lower()
+        if time_mode not in {"seconds", "index", "percent"}:
             raise ValueError("Bad time_mode")
-        presets = {
-            "ace15": 5.0,
-            "yue2": 25.0,
-        }
-        fr = presets.get(framerate_hz)
-        if fr is None and framerate_hz:
-            with contextlib.suppress(ValueError):
-                fr = float(framerate_hz)
-        if fr is None or fr <= 0:
-            raise ValueError(
-                "Bad format for framerate_hz. Must either be a preset or positive non-zero floating point value",
-            )
-        codes = parse_audio_codes(audio_codes, n_codes=0)
+        if output_mode not in {
+            "tokens",
+            "integers_commasep",
+            "integers_spacesep",
+            "json",
+        }:
+            raise ValueError("Bad output mode")
+        if time_mode == "seconds":
+            presets = {
+                "ace15": 5.0,
+                "yue2": 25.0,
+            }
+            fr = presets.get(framerate_hz)
+            if fr is None and framerate_hz:
+                with contextlib.suppress(ValueError):
+                    fr = float(framerate_hz)
+            if fr is None or fr <= 0:
+                raise ValueError(
+                    "Bad format for framerate_hz. Must either be a preset or positive non-zero floating point value",
+                )
+        else:
+            fr = 0.0
+        codes = parse_audio_codes(audio_codes, codebook_size=0)
         n_codes = len(codes)
         if time_mode == "seconds":
+            start, end = start * fr, end * fr
+        elif time_mode == "percent":
+            start, end = n_codes * start, n_codes * end
+        start_idx = min(
+            n_codes - 1,
+            max(0, int(n_codes + start if start < 0 else start)),
+        )
+        end_idx = min(
+            n_codes,
+            max(0, int(n_codes + end if end < 0 else end)),
+        )
+        if time_mode == "seconds":
+            start, end = start_idx / fr, end_idx / fr
+        elif time_mode == "percent":
             start, end = (
-                round(tval * fr) + n_codes * int(tval < 0) for tval in (start, end)
+                (start_idx / n_codes, end_idx / n_codes) if n_codes > 0 else (0.0, 0.0)
             )
         else:
-            # index mode handling
-            start, end = (
-                int(tval if tval >= 0 else n_codes + tval) for tval in (start, end)
-            )
-        print(f"CODES: start={start}, end={end}, n_codes={n_codes}")
-        if not (start < end and all(0 <= tval < n_codes for tval in (start, end))):
-            raise ValueError("Time out of range or start is greater than end")
-        codes = "".join(f"<|audio_code_{c}|>" for c in codes[start:end])
-        return (codes,)
+            start, end = float(start_idx), float(end_idx)
+        time_range = end - start if start < end else 0.0
+        codes_slice = codes[start_idx:end_idx]
+        output_length = len(codes_slice)
+        codes_gen = (
+            (f"<|audio_code_{c}|>" for c in codes_slice)
+            if output_mode == "tokens"
+            else (str(c) for c in codes_slice)
+        )
+        delim = (
+            ""
+            if output_mode == "tokens"
+            else (" " if output_mode == "integers_spacesep" else ", ")
+        )
+        result = delim.join(codes_gen)
+        if output_mode == "json":
+            result = f"[{result}]"
+        return (
+            result,
+            n_codes,
+            output_length,
+            start_idx,
+            end_idx,
+            time_range,
+            start,
+            end,
+        )
