@@ -1,4 +1,4 @@
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, NamedTuple
 
 import torch
@@ -47,6 +47,51 @@ def fixup_waveform(
     if ensure_stereo and waveform.shape[1] == 1:
         waveform = waveform.repeat(1, 2, 1)
     return waveform
+
+
+def parse_audio_codes(
+    audio_codes: str | Sequence[int] | None,
+    *,
+    codebook_size: int = 64000,
+) -> tuple[int, ...]:
+    if audio_codes is None:
+        return ()
+    if isinstance(audio_codes, str):
+        audio_codes = audio_codes.strip()
+        try:
+            start_idx = audio_codes.index("<|audio_code_")
+        except ValueError:
+            start_idx = None
+        if start_idx is not None:
+            audio_codes = audio_codes[start_idx:]
+            try:
+                end_idx = audio_codes.rindex("<|audio_code_")
+                end_idx = audio_codes[end_idx:].index("|>") + end_idx + 1
+            except ValueError:
+                end_idx = None
+            if end_idx is not None:
+                audio_codes = audio_codes[:end_idx]
+            cs = tuple(
+                ac.rsplit("_", 1)[-1].strip()
+                for ac in audio_codes.split("|")
+                if ac.startswith("audio_code_")
+            )
+        else:
+            cs = tuple(ac.strip() for ac in audio_codes.split(","))
+        if not all(ac.isdigit() for ac in cs if ac):
+            raise ValueError(
+                "When specified as a string, codes must be comma separated integer values or a sequence of <|audio_code_123|> tokens",
+            )
+        audio_codes = tuple(int(ac) for ac in cs if ac)
+    else:
+        audio_codes = tuple(audio_codes)
+    if not all(
+        isinstance(ac, int) and (codebook_size < 1 or (0 <= ac < codebook_size))
+        for ac in audio_codes
+    ):
+        errstr = f"Audio codes must parse to integer values >= 0 and < {codebook_size} (if {codebook_size} is non-zero)."
+        raise ValueError(errstr)
+    return audio_codes
 
 
 class TieredBlendWrapper:
