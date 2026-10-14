@@ -167,31 +167,6 @@ ACE10_SILENCE = torch.tensor(
 )[None, ..., None]
 
 
-def parse_audio_codes(audio_codes: str | Sequence[int] | None) -> tuple[int, ...]:
-    if audio_codes is None:
-        return ()
-    if isinstance(audio_codes, str):
-        audio_codes = audio_codes.strip()
-        if audio_codes.startswith("<|audio_code_"):
-            cs = tuple(
-                ac.rsplit("_", 1)[-1].strip()
-                for ac in audio_codes.split("|")
-                if ac.startswith("audio_code_")
-            )
-        else:
-            cs = tuple(ac.strip() for ac in audio_codes.split(","))
-        if not all(ac.isdigit() for ac in cs if ac):
-            raise ValueError(
-                "When specified as a string, codes must be comma separated integer values or a sequence of <|audio_code_123|> tokens",
-            )
-        audio_codes = tuple(int(ac) for ac in cs if ac)
-    else:
-        audio_codes = tuple(audio_codes)
-    if not all(isinstance(ac, int) and (0 <= ac < 64000) for ac in audio_codes):
-        raise TypeError("Audio codes must parse to integer values >= 0 and < 64000.")
-    return audio_codes
-
-
 class DeconstructedHints(NamedTuple):
     indices: torch.Tensor
     hints_2048d: torch.Tensor

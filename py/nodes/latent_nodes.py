@@ -46,7 +46,7 @@ class SilentLatentNode:
                 "ref_latent_opt": (
                     "LATENT",
                     {
-                        "tooltip": "When connected the other parameters are ignored and the latent output will match the length/batch size of the reference. This needs to be connected to get a ACE-Steps 1.5 silent latent."
+                        "tooltip": "When connected the other parameters are ignored and the latent output will match the length/batch size of the reference. This needs to be connected to get a ACE-Steps 1.5 silent latent.",
                     },
                 ),
             },
@@ -59,10 +59,14 @@ class SilentLatentNode:
         ndim = len(ref_shape)
         if ndim == 4 and ref_shape[-2] != 1:
             raise ValueError(
-                "Can't handle 4D ACE 1.5 latent with non-empty dimension -2"
+                "Can't handle 4D ACE 1.5 latent with non-empty dimension -2",
             )
         latent = torch.zeros(
-            ref_shape[0], 64, ref_shape[-1], device="cpu", dtype=torch.float32
+            ref_shape[0],
+            64,
+            ref_shape[-1],
+            device="cpu",
+            dtype=torch.float32,
         )
         latent += get_ace15_silence_latent(ref_shape[-1], device="cpu").to(latent)
         if ndim == 4:
@@ -79,7 +83,12 @@ class SilentLatentNode:
         else:
             length = int(seconds * LATENT_TIME_MULTIPLIER)
             latent = torch.zeros(
-                batch_size, 8, 16, length, device="cpu", dtype=torch.float32
+                batch_size,
+                8,
+                16,
+                length,
+                device="cpu",
+                dtype=torch.float32,
             )
         latent += ACE10_SILENCE
         return ({"samples": latent, "type": "audio"},)
