@@ -4,12 +4,18 @@ import folder_paths
 import torch
 import yaml
 from comfy import model_management
+from comfy_execution.graph import ExecutionBlocker
 from tokenizers import AddedToken
 
 from .. import external
 from ..llm import LLMSampling, get_token_idxs
-from ..llm_yue2 import ModelYuE2LLM, YuE2LLMSamplingState, yue2
-from ..yue2_support import MERT2TokenizerAudioEncoderModel
+from ..llm_yue2 import (
+    ModelYuE2LLM,
+    TokenizerTopKGuideConfig,
+    YuE2LLMSamplingState,
+    yue2,
+)
+from ..yue2_support import MERT2TokenizerAudioEncoderModel, TokenizerTopK
 
 
 def get_yue2_tokenizer(clip: object) -> object:
@@ -144,6 +150,64 @@ sampling_dtype: float64
 # One of: new, full, from_abc, from_music
 output_mode: new
 
+# Only used when the tokenizer_topk input is connected.
+tokenizer_guide_parameters:
+    # 25 frames per second. Negative values for start/end mean no restriction.
+    start_frame: 0
+    end_frame: -1
+    frame_offset: 0
+    # When disabled, bans the MUSIC_END token there's a guide match.
+    allow_end_token: false
+    # Linear interpolation by default. You can also try setting this to inject to
+    # simply add the guide logits.
+    blend_mode: lerp
+    # Blend scale for the guide logits.
+    scale: 0.5
+    # Either null or one of the following:
+    #    scale_up: The scale gets multiplied by the progress between start_frame and end_frame.
+    #  scale_down: Same as scale_up, but with the scale inverted.
+    #         sin: Ramps up such that scale reaches the target at 50% of progress (then it descends).
+    #     inv_sin: Like sin, except the scale multiplier starts at 1 and reaches 0 at 50% of progress.
+    schedule: null
+    # Only has an effect when schedule is set. Exponent for progress, applied after the schedule type.
+    schedule_power: 1.0
+    # When set, clamps the minimum scale to this value. Only useful with scheduling.
+    scale_min: null
+    # When set, clamps the maximum scale to this value. Only useful with scheduling.
+    scale_max: null
+    # Allows setting a start/end slice for the guide top-K. I.E. you can save the top 200 but
+    # only use the top 20 items by leaving start at null (or 0) and setting k_end to 20.
+    k_start: null
+    k_end: null
+    # If k drops below 1 (based on schedule, etc), the guide will be disabled automatically.
+    k_min: 0
+    # Negative values mean no restriction.
+    k_max: -1
+    # Same options as the schedule parameter below. Schedule scaling applies to the spread
+    # between k_start and k_end.
+    k_schedule: null
+    k_schedule_power: 1.0
+    # When non-zero, will align the top guide logit with the YuE2 LLM's logits.
+    # At ratio 1.0, the top guide logit will be equal to the top LLM logit.
+    align_topk_blend: 0.0
+    # Scale factor on the top LLM logit. Only has an effect when align_topk_blend isn't 0.
+    align_topk_scale: 1.0
+    # When false, only allows scaling down the guide logits.
+    align_topk_allow_up: true
+    # When false, only allows scaling up the guide logits.
+    align_topk_allow_down: true
+    # When true, calculates the top logit across the whole batch (cond and uncond).
+    align_topk_full_batch: false
+    # When enabled will run the logits through log softmax.
+    convert_scores: true
+    # When enabled, will always run the scores through log softmax.
+    always_convert_scores: false
+    # If false, will try to guide uncond instead (requires CFG).
+    guide_cond: true
+    # Position to insert the logits processor. The CFG processor will be at position 0, so
+    # you may want to set this to 1 to insert it after.
+    processor_index: 0
+
 sampling_parameters:
     seed: 123
     # Does logit sampling/manipulation in float64 by default. I don't recommend
@@ -254,6 +318,12 @@ Your lyrics
                         "tooltip": "Optional custom noise input for temperature sampling. Can take custom noise inputs from my ComfyUI-Sonar and comfyui_overly_complicated_sampling node packs. Note: You will probably want to use a noise factor around 0.4 to 0.6 and also make sure that the noise is normalized. This will not work well with noise samplers that care about the sigma.",
                     },
                 ),
+                "tokenizer_topk": (
+                    "YUE2_TOKENIZER_TOPK",
+                    {
+                        "tooltip": "If supplied, will guide sampling using tokenizer logits.",
+                    },
+                ),
             },
         }
 
@@ -269,6 +339,7 @@ Your lyrics
         yaml_params: str,
         llm_prompt_negative: str | None = None,
         custom_noise: object | None = None,
+        tokenizer_topk: tuple[TokenizerTopK, ...] | None = None,
     ) -> tuple:
         external.ensure_blend_modes()
         params = yaml.safe_load(yaml_params)
@@ -278,6 +349,22 @@ Your lyrics
         if output_mode not in {"new", "full", "from_abc", "from_music"}:
             raise ValueError("Bad output mode")
         sampling_params = params.get("sampling_parameters", {})
+        guide_config = (
+            None
+            if not tokenizer_topk
+            else params.pop("tokenizer_guide_parameters", None)
+        )
+        if guide_config is not None and not isinstance(guide_config, dict):
+            raise TypeError(
+                "tokenizer_guide_parameters must be a YAML object or null if supplied",
+            )
+        tokenizer_guide = (
+            None
+            if guide_config is None
+            else TokenizerTopKGuideConfig.build(**guide_config)._replace(
+                topk_chunks=tokenizer_topk,
+            )
+        )
         minimum_tokens, maximum_tokens = (
             min(minimum_tokens, maximum_tokens),
             max(minimum_tokens, maximum_tokens),
@@ -354,6 +441,7 @@ Your lyrics
             state_class=partial(
                 YuE2LLMSamplingState,
                 audio_only=eos_token_id == yue2.MUSIC_END,
+                tokenizer_guide=tokenizer_guide,
                 eos_token_id=eos_token_id,
                 custom_noise=None if custom_noise is None else custom_noise.clone(),
                 **sampling_params,
@@ -381,7 +469,7 @@ Your lyrics
 
 
 class LoadYuE2TokenizerAudioEncoderNode:
-    DESCRIPTION = "TBD"
+    DESCRIPTION = "Loader for MERT2 FullSong and MotherSuperior's YuE2 audio tokenizer."
     FUNCTION = "go"
     CATEGORY = "audio/acetricks"
     RETURN_TYPES = ("AUDIO_ENCODER",)
@@ -394,7 +482,7 @@ class LoadYuE2TokenizerAudioEncoderNode:
                 "mert2_fullsong": (
                     encoders_list,
                     {
-                        "default": "mert2_fullsong.safetensors",
+                        "default": "mert2-fullsong.safetensors",
                     },
                 ),
                 "tokenizer_head": (
@@ -425,11 +513,11 @@ class LoadYuE2TokenizerAudioEncoderNode:
 
 
 class YuE2AudioToCodesNode:
-    DESCRIPTION = "TBD"
+    DESCRIPTION = "Converts audio to YuE2 codes. Load the audio encoder with the LoadYuE2TokenizerAudioEncoder node."
     FUNCTION = "go"
     CATEGORY = "audio/acetricks"
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
+    RETURN_TYPES = ("STRING", "YUE2_TOKENIZER_TOPK")
+    OUTPUT_IS_LIST = (True, True)
 
     @classmethod
     def INPUT_TYPES(cls) -> dict:
@@ -437,21 +525,62 @@ class YuE2AudioToCodesNode:
             "required": {
                 "audio_encoder": ("AUDIO_ENCODER",),
                 "audio": ("AUDIO",),
+                "tokenizer_topk": (
+                    "INT",
+                    {
+                        "min": 0,
+                        "max": 32768,
+                        "tooltip": "When non-zero, the node will output the top-K logits for each frame.",
+                    },
+                ),
+                "pad_seconds": (
+                    "FLOAT",
+                    {
+                        "min": 0.0,
+                        "max": 9999.0,
+                        "default": 1.0,
+                        "tooltip": "When enabled, left-pads the audio with silence. The padded section is stripped from the output.",
+                    },
+                ),
             },
         }
 
     @classmethod
-    def go(cls, *, audio_encoder: object, audio: dict) -> tuple[list[str]]:
+    def go(
+        cls,
+        *,
+        audio_encoder: object,
+        audio: dict,
+        tokenizer_topk: int,
+        pad_seconds: float,
+    ) -> tuple[
+        list[str],
+        list[ExecutionBlocker] | list[tuple[TokenizerTopK, ...]],
+    ]:
         if not isinstance(audio_encoder, MERT2TokenizerAudioEncoderModel):
             raise ValueError(  # noqa: TRY004
                 "Unexpected audio encoder. Use the LoadYuE2TokenizerAudioEncoder node to load the audio encoder.",
             )
-        codes = audio_encoder.audio_to_yue2_codes(
+        codes, topk_list = audio_encoder.audio_to_yue2_codes(
             waveform=audio["waveform"],
             sample_rate=audio["sample_rate"],
-        ).to(device="cpu", dtype=torch.int32)
-        result = [
+            save_topk=tokenizer_topk,
+        )
+        codes = codes.to(device="cpu", dtype=torch.int32)
+        codes_result = [
             "".join(f"<|audio_code_{code}|>" for code in batch_item)
             for batch_item in codes.tolist()
         ]
-        return (result,)
+        batch_size = len(codes_result)
+        if not topk_list:
+            no_topk_eb = ExecutionBlocker("Returning top-K items was disabled")
+            return (codes_result, [no_topk_eb] * batch_size)
+        cpu_device = torch.device("cpu")
+        topk_result = [
+            tuple(
+                tki.get_batch(bidx).to(device=cpu_device, dtype=torch.float32)
+                for tki in topk_list
+            )
+            for bidx in range(batch_size)
+        ]
+        return (codes_result, topk_result)

@@ -228,6 +228,7 @@ class CFGExtLogitsProcessor(transformers.LogitsProcessor):
         mean_rescaling_target: str = "cond",
         temperature: float = 1.0,
         final_remask: bool = True,
+        logprobs_offset: float = 0.0,
     ):
         self.guidance_scale = guidance_scale
         self.guidance_space = guidance_space
@@ -241,6 +242,7 @@ class CFGExtLogitsProcessor(transformers.LogitsProcessor):
         self.mean_rescaling_strength = mean_rescaling_strength
         self.mean_rescaling_target = mean_rescaling_target
         self.final_remask = final_remask
+        self.logprobs_offset = logprobs_offset
 
         self.blend_strategy = blend_strategy
         if blend_mode is not None:
@@ -259,18 +261,34 @@ class CFGExtLogitsProcessor(transformers.LogitsProcessor):
             self.blend_function = self.simple_cfg
 
     def _to_guidance_space(
-        self, cond: torch.Tensor, uncond: torch.Tensor
+        self,
+        cond: torch.Tensor,
+        uncond: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if self.guidance_space not in {"probs", "logprobs"}:
+        gspace = self.guidance_space
+        if gspace not in {"probs", "logprobs", "logprobs_raw"}:
             return cond, uncond
         cond = cond / self.temperature if self.temperature != 1.0 else cond
         uncond = uncond / self.temperature if self.temperature != 1.0 else uncond
         fun = (
             torch.nn.functional.log_softmax
-            if self.guidance_space == "logprobs"
+            if gspace in {"logprobs", "logprobs_raw"}
             else torch.softmax
         )
-        return fun(cond, dim=-1), fun(uncond, dim=-1)
+        result = fun(cond, dim=-1), fun(uncond, dim=-1)
+        if gspace == "logprobs":
+            if self.logprobs_offset == 0:
+                result = tuple(
+                    tv.sub_(tv.min(dim=-1, keepdim=True).values) for tv in result
+                )
+            else:
+                result = tuple(
+                    tv.sub_(
+                        tv.max(dim=-1, keepdim=True).values.sub_(self.logprobs_offset),
+                    )
+                    for tv in result
+                )
+        return result
 
     # Uses in-place operations.
     def _from_guidance_space(
@@ -280,10 +298,13 @@ class CFGExtLogitsProcessor(transformers.LogitsProcessor):
         min_logit: float = 1e-08,
     ) -> torch.Tensor:
         if self.guidance_space == "probs":
-            result = result.clamp_(min=min_logit)
+            result = result.clamp_min_(min_logit)
             result /= result.sum(dim=-1, keepdim=True)
             result = result.log_()
-        if self.guidance_space in {"probs", "logprobs"} and self.temperature != 1.0:
+        if (
+            self.guidance_space in {"probs", "logprobs", "logprobs_raw"}
+            and self.temperature != 1.0
+        ):
             result *= self.temperature
         return result
 
@@ -470,6 +491,7 @@ class LLMSamplingState:
             "cfg_mean_rescaling_strength": "mean_rescaling_strength",
             "cfg_mean_rescaling_target": "mean_rescaling_target",
             "cfg_final_remask": "final_remask",
+            "cfg_logprobs_offset": "logprobs_offset",
         }
         self.cfg_kwargs = {
             cfg_k: kwargs.pop(k) for k, cfg_k in cfg_kwargs_map.items() if k in kwargs

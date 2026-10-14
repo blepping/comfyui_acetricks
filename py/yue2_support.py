@@ -1,4 +1,4 @@
-from typing import Self
+from typing import Any, NamedTuple, Self
 
 import torch
 from comfy import model_management, model_patcher, ops, storage
@@ -8,6 +8,41 @@ from comfy.audio_encoders import audio_encoders, mert2
 from comfy.audio_encoders.sheetsage2 import sliding_window_plan
 from comfy.ldm.modules.attention import optimized_attention_for_device
 from torch import nn
+
+
+class TokenizerTopK(NamedTuple):
+    frame_offset: int
+    f_start: int
+    f_end: int
+    indices: torch.Tensor
+    values: torch.Tensor
+
+    @property
+    def batch_size(self) -> int:
+        return self.indices.shape[0]
+
+    @property
+    def last_frame(self):
+        return max(0, self.frame_offset + self.f_end - 1)
+
+    def get_batch(self, idx: int) -> Self:
+        b_slice = slice(idx, idx + 1)
+        return self._replace(indices=self.indices[b_slice], values=self.values[b_slice])
+
+    def clone(self) -> Self:
+        return self._replace(indices=self.indices.clone(), values=self.values.clone())
+
+    def to(
+        self,
+        *,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+        copy: bool = False,
+    ) -> Self:
+        return self._replace(
+            indices=self.indices.to(device=device, copy=copy),
+            values=self.values.to(device=device, dtype=dtype, copy=copy),
+        )
 
 
 class MERT2Encoder(mert2.MERT2):
@@ -42,6 +77,10 @@ class TokenizerHead(nn.Module):
         operations=ops.manual_cast,
     ):
         super().__init__()
+        self.max_len = max_len
+        self.vocab_size = vocab_size
+        self.device = device
+        self.dtype = dtype
         self.inp = operations.Linear(in_dim, d_model, device=device, dtype=dtype)
         self.pos = nn.Parameter(torch.zeros(1, max_len, d_model))
         # TODO: Split up to use operations/ComfyUI's attention handling.
@@ -53,7 +92,11 @@ class TokenizerHead(nn.Module):
             batch_first=True,
             norm_first=True,
         )
-        self.enc = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.enc = nn.TransformerEncoder(
+            encoder_layer,
+            num_layers=n_layers,
+            enable_nested_tensor=False,
+        )
         self.norm = operations.LayerNorm(d_model, device=device, dtype=dtype)
         self.head = operations.Linear(
             d_model,
@@ -124,17 +167,24 @@ class MERT2TokenizerAudioEncoderModel(audio_encoders.AudioEncoderModel):
             raise ValueError(f"Unknown state dict keys: {unknown}")  # noqa: EM102
         return audio_encoder
 
-    def get_mert2_feats(self, *, waveform: torch.Tensor) -> torch.Tensor:
+    def get_mert2_feats(
+        self,
+        *,
+        waveform: torch.Tensor,
+        window_size: float = 300.0,
+        overlap_size: float = 200.0,
+        lookahead_size: float = 100.0,
+    ) -> torch.Tensor:
         encoder = self.model.mert2_encoder
         sr, fps = self.model_sample_rate, 25.0
         duration = waveform.shape[-1] / sr
-        if duration <= 300.0:
+        if duration <= window_size:
             return encoder(encoder.feature_extractor(waveform), n_layers=20)
         plan = sliding_window_plan(
             duration,
-            window_seconds=300.0,
-            overlap_seconds=200.0,
-            lookahead_seconds=100.0,
+            window_seconds=window_size,
+            overlap_seconds=overlap_size,
+            lookahead_seconds=lookahead_size,
         )
         chunks = []
         for w in plan:
@@ -157,9 +207,12 @@ class MERT2TokenizerAudioEncoderModel(audio_encoders.AudioEncoderModel):
         feat: torch.Tensor,
         normalize: bool = True,
         in_place: bool = True,
-        chunk_size: int = 512,
+        save_topk: int = 0,
+        window_size: float = 512.0,
+        overlap_size: float = 0.0,
+        lookahead_size: float = 0.0,
         eps: float | None = None,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, list[TokenizerTopK]]:
         tokenizer_head = self.model.tokenizer_head
         if normalize:
             if eps is None:
@@ -170,23 +223,56 @@ class MERT2TokenizerAudioEncoderModel(audio_encoders.AudioEncoderModel):
             feat = feat.sub_(mean).div_(std.clamp_min_(eps))
 
         frames = feat.shape[1]
+        plan = sliding_window_plan(
+            float(frames),
+            window_seconds=window_size,
+            overlap_seconds=overlap_size,
+            lookahead_seconds=lookahead_size,
+        )
         tokens_list = []
+        topk_list = []
 
-        for start_idx in range(0, frames, chunk_size):
-            end_idx = min(start_idx + chunk_size, frames)
-            feat_chunk = feat[:, start_idx:end_idx, :]
-            # [B, chunk_len, 32768]
+        for w in plan:
+            start, end = round(w["start"]), round(w["end"])
+            feat_chunk = feat[:, start:end, :]
             logits = tokenizer_head(feat_chunk)
-            codes = logits.argmax(dim=-1)
+            rel_start = w["accept_start"] - w["start"]
+            rel_end = w["accept_end"] - w["start"]
+            f_start = round(rel_start)
+            f_end = round(rel_end)
+            codes = logits[:, f_start:f_end, :].argmax(dim=-1)
             tokens_list.append(codes)
-        return torch.cat(tokens_list, dim=1)
+            if save_topk < 1:
+                continue
+            logits = nn.functional.log_softmax(logits, dim=-1)
+            logits -= logits.min(dim=-1, keepdim=True).values
+            tk_vals, tk_idxs = torch.topk(logits, k=save_topk, dim=-1)
+            topk_list.append(
+                TokenizerTopK(
+                    frame_offset=start,
+                    f_start=f_start,
+                    f_end=f_end,
+                    values=tk_vals,
+                    indices=tk_idxs,
+                ),
+            )
+
+        return (torch.cat(tokens_list, dim=1), topk_list)
 
     def audio_to_yue2_codes(
         self,
         *,
         waveform: torch.Tensor,
         sample_rate: float,
-    ) -> torch.Tensor:
+        save_topk: int = 0,
+        mert2_window_size: float = 512.0,
+        mert2_overlap_size: float = 0.0,
+        mert2_lookahead_size: float = 0.0,
+        tokenizer_normalize: bool = True,
+        tokenizer_window_size: float = 512.0,
+        tokenizer_overlap_size: float = 0.0,
+        tokenizer_lookahead_size: float = 0.0,
+    ) -> tuple[torch.Tensor, list[TokenizerTopK]]:
         sr = 24000.0
         model_management.load_model_gpu(self.patcher)
         device = self.load_device
@@ -199,5 +285,17 @@ class MERT2TokenizerAudioEncoderModel(audio_encoders.AudioEncoderModel):
         waveform = waveform.float().mean(dim=1).to(device=device)
         if sample_rate != sr:
             waveform = resample_audio(waveform, sample_rate, sr)
-        feat = self.get_mert2_feats(waveform=waveform)
-        return self.tokenize_mert2_feats(feat=feat)
+        feat = self.get_mert2_feats(
+            waveform=waveform,
+            window_size=mert2_window_size,
+            overlap_size=mert2_overlap_size,
+            lookahead_size=mert2_lookahead_size,
+        )
+        return self.tokenize_mert2_feats(
+            feat=feat,
+            normalize=tokenizer_normalize,
+            save_topk=save_topk,
+            window_size=tokenizer_window_size,
+            overlap_size=tokenizer_overlap_size,
+            lookahead_size=tokenizer_lookahead_size,
+        )
